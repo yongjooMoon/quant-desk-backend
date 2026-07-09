@@ -30,8 +30,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "https://unvcqrjzvtgtjovfyvow.supabase.co")
-SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVudmNxcmp6dnRndGpvdmZ5dm93Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDU0MzkyMSwiZXhwIjoyMDk2MTE5OTIxfQ.q_CFPdxUFUyw_Q8hy0FS3M5WPXRetSkMcjO4fwMMSgs")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # 🔐 --- [ Fernet 복호화 모듈 세팅 - app.py와 100% 동일하게 일치화 ] ---
