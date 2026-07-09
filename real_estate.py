@@ -1,10 +1,10 @@
-import streamlit as st
+# ⚠️ import streamlit as st 가 완전히 삭제된 순수 파이썬/FastAPI용 백엔드 모듈입니다.
 import requests
 import urllib.parse
 import json
 import xml.etree.ElementTree as ET
 import openpyxl
-import html  # 🛡️ XSS 방어용 파이썬 내장 라이브러리 추가
+import html 
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from io import BytesIO
@@ -24,11 +24,9 @@ seoul_dong_pool = {
     '11530': ['신도림동', '구로동', '가리봉동', '고척동', '개봉동', '오류동', '궁동', '온수동', '천왕동', '항동']
 }
 
-
 def clean_apt_name(name):
     if not name: return ""
     return name.replace(" ", "").replace("(주상복합)", "").replace("(도시형생활주택)", "").replace("주상복합", "").replace("아파트", "")
-
 
 def extract_items(response_text):
     text = response_text.strip()
@@ -59,7 +57,6 @@ def extract_items(response_text):
             return []
     return []
 
-
 def get_field(item, *keys):
     if isinstance(item, dict):
         for k in keys:
@@ -71,11 +68,8 @@ def get_field(item, *keys):
             if val is not None: return val.strip()
         return ""
 
-
 def generate_excel_data(api_key, district_code, district_name, target_dong, start_date, end_date, apt_filters):
     log_text = ""
-    last_response_preview = "응답 없음 (호출 시도 안됨)"
-
     yield "progress", "🔄 데이터 추출을 시작합니다..."
 
     api_key = urllib.parse.unquote(api_key.strip())
@@ -104,20 +98,14 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
         master_scan_months.append(current.strftime("%Y%m"))
         current += relativedelta(months=1)
 
-    # 🛡️ XSS 방어: 동 이름 이스케이프
     safe_target_dong = html.escape(str(target_dong or ''))
     dong_log = f"'{safe_target_dong}' 전체" if target_dong != "전체" else "구 전체"
-    log_text += f"\n🔄 [1단계] {master_scan_months[0] if master_scan_months else '없음'} ~ {master_scan_months[-1] if master_scan_months else '없음'} 기간 {dong_log} 실거래가 추출 중...\n"
+    log_text += f"\n🔄 [1단계] {master_scan_months[0]} ~ {master_scan_months[-1]} 기간 {dong_log} 실거래가 추출 중...\n"
     yield "log", log_text
 
     for deal_ymd in master_scan_months:
         for url_endpoint in trade_api_urls:
-            trade_params = {
-                'serviceKey': api_key,
-                'LAWD_CD': district_code,
-                'DEAL_YMD': deal_ymd,
-                'numOfRows': '10000'
-            }
+            trade_params = {'serviceKey': api_key, 'LAWD_CD': district_code, 'DEAL_YMD': deal_ymd, 'numOfRows': '10000'}
             try:
                 res_trade = requests.get(url_endpoint, params=trade_params, timeout=10)
                 count_trade_api += 1
@@ -125,9 +113,6 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
                 if "LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS ERROR" in res_trade.text:
                     yield "error", "국토교통부 실거래가 API 일일 호출 한도를 초과했습니다."
                     return
-
-                if res_trade.text:
-                    last_response_preview = res_trade.text[:200]
 
                 if res_trade.status_code == 200:
                     items = extract_items(res_trade.text)
@@ -157,7 +142,6 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
                             d_month = get_field(item, 'dealMonth', '월').zfill(2)
                             d_day = get_field(item, 'dealDay', '일').zfill(2)
 
-                            # 🛡️ XSS 방어: 구/동 이름 이스케이프
                             safe_district_name = html.escape(str(district_name or ''))
                             safe_dong = html.escape(str(dong or ''))
                             region_key = f"{safe_district_name} ({safe_dong})"
@@ -170,29 +154,18 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
                             deals_filtered_map[group_key].append({'deal_amount': amt_val, 'deal_date': deal_date_full})
                         except Exception:
                             continue
-            except Exception as e:
-                last_response_preview = f"Exception 발생: {str(e)}"
+            except Exception:
                 continue
 
     if not deals_filtered_map:
-        debug_info = html.escape(last_response_preview.replace('\n', ' ').strip())
-        error_msg = (
-            "설정하신 조건(기간/동/필터)에 해당하는 실거래 내역이 없습니다.\n"
-            f"🔍 [API 응답 디버깅]: {debug_info}"
-        )
-        yield "error", error_msg
+        yield "error", "설정하신 조건(기간/동/필터)에 해당하는 실거래 내역이 없습니다."
         return
 
     log_text += f"\n🏢 [2단계] K-APT 인덱싱 스캔 시작...\n"
     yield "log", log_text
 
     for bjd_code in unique_bjd_codes:
-        list_params_bjd = {
-            'serviceKey': api_key,
-            'bjdCode': bjd_code,
-            'numOfRows': '9999',
-            'pageNo': '1'
-        }
+        list_params_bjd = {'serviceKey': api_key, 'bjdCode': bjd_code, 'numOfRows': '9999', 'pageNo': '1'}
         try:
             res_list = requests.get(url_apt_list_bjd, params=list_params_bjd, timeout=5)
             count_kapt_api += 1
@@ -202,19 +175,13 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
         except:
             pass
 
-    list_params_sig = {
-        'serviceKey': api_key,
-        'sigunguCode': district_code,
-        'numOfRows': '9999',
-        'pageNo': '1'
-    }
+    list_params_sig = {'serviceKey': api_key, 'sigunguCode': district_code, 'numOfRows': '9999', 'pageNo': '1'}
     try:
         res_list = requests.get(url_apt_list_sigungu, params=list_params_sig, timeout=10)
         count_kapt_api += 1
         for item in extract_items(res_list.text):
             kcode = get_field(item, 'kaptCode')
             if kcode: kapt_name_to_code[clean_apt_name(get_field(item, 'kaptName'))] = kcode
-    # 🌟 버그 수정 완료: 기존 코드에서 들여쓰기가 잘못되어 있던 except 구문을 올바른 위치로 정렬했습니다.
     except:
         pass
 
@@ -230,10 +197,7 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
 
         if target_kcode:
             try:
-                info_params = {
-                    'serviceKey': api_key,
-                    'kaptCode': target_kcode
-                }
+                info_params = {'serviceKey': api_key, 'kaptCode': target_kcode}
                 res_info = requests.get(url_apt_info, params=info_params, timeout=5)
                 count_kapt_api += 1
 
@@ -265,8 +229,7 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
 
                         apt_details_map[trade_cleaned_key] = {'households': raw_h_cnt, 'move_in': parsed_dt,
                                                               'classification': classification}
-
-                        # 🛡️ XSS 방어: 로그 출력부 이스케이프
+                        
                         safe_apt_nm = html.escape(str(apt_nm or ''))
                         safe_parsed_dt = html.escape(str(parsed_dt or ''))
                         safe_raw_h_cnt = html.escape(str(raw_h_cnt or ''))
@@ -275,7 +238,6 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
             except:
                 pass
         else:
-            # 🛡️ XSS 방어: 로그 출력부 이스케이프
             safe_apt_nm = html.escape(str(apt_nm or ''))
             log_text += f"❌ K-APT 매칭 실패: {safe_apt_nm}\n"
             yield "log", log_text
@@ -301,8 +263,7 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
     border_thin = Side(border_style="thin", color="D3D3D3")
     cell_border = Border(left=border_thin, right=border_thin, top=border_thin, bottom=border_thin)
 
-    headers = ["구분", "단지명", "입주시기", "세대수", "공급면적(㎡)", "전용면적(㎡)", "공급(py)", "전용(py)", "전용률", "매매가", "공급평단가", "전용평단가",
-               "계약일자"]
+    headers = ["구분", "단지명", "입주시기", "세대수", "공급면적(㎡)", "전용면적(㎡)", "공급(py)", "전용(py)", "전용률", "매매가", "공급평단가", "전용평단가", "계약일자"]
     ws.append(headers)
 
     for col_idx in range(1, 14):
@@ -436,52 +397,3 @@ def generate_excel_data(api_key, district_code, district_name, target_dong, star
         "data": output.getvalue(),
         "filename": f"[{district_name}_{target_dong}]_실거래_분석.xlsx"
     }
-
-
-def run_real_estate_page(rtms_key):
-    st.title("🏢 아파트 실거래가 정밀 분석 엔진")
-    if not rtms_key:
-        st.info("⚠️ 상단 '내 API 키 자산 설정' 메뉴에서 국토교통부 실거래가 키를 먼저 저장해 주세요.")
-        return
-
-    gu_name = st.selectbox("자치구", list(seoul_gu_pool.values()), index=23)
-    gu_code = [k for k, v in seoul_gu_pool.items() if v == gu_name][0]
-    dong_name = st.selectbox("법정동", ["전체 (구 단위)"] + sorted(seoul_dong_pool.get(gu_code, [])))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("시작 월", datetime(datetime.now().year, 1, 1))
-    with col2:
-        end_date = st.date_input("종료 월", datetime(datetime.now().year, datetime.now().month, 1))
-
-    filter_text = st.text_input("필터 단어 (쉼표 구분)")
-
-    if st.button("✨ 부동산 데이터 대시보드 빌드", type="primary", width="stretch"):
-        target_dong = "전체" if dong_name.startswith("전체") else dong_name
-        apt_filters = [t.strip() for t in filter_text.split(',')] if filter_text.strip() else []
-
-        log_area = st.empty()
-        result_excel = None
-
-        for status, payload in generate_excel_data(rtms_key, gu_code, gu_name, target_dong, start_date, end_date,
-                                                   apt_filters):
-            if status == "progress":
-                with st.spinner(payload):
-                    pass
-            elif status == "log":
-                log_area.text_area("💻 실시간 데이터 분석 로그", payload, height=300)
-            elif status == "error":
-                st.error(f"🚫 오류 발생: {html.escape(str(payload or ''))}")
-                st.stop()
-            elif status == "success":
-                result_excel = payload
-
-        if result_excel:
-            st.success("데이터 추출 성공! 아래 버튼을 눌러 엑셀 파일을 다운로드하세요.")
-            st.download_button(
-                label="📥 엑셀 파일 다운로드",
-                data=result_excel["data"],
-                file_name=result_excel["filename"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch"
-            )
