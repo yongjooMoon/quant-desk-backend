@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+supabase
+python-dotenv
+finance-datareader
+beautifulsoup4
+requests
+pandas
+openpyxl
+lxml
