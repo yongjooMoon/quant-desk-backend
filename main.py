@@ -38,29 +38,24 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL els
 
 # ==============================================================================
 # 🌟 인메모리(RAM) 캐시 설정
-# TTLCache: 정해진 시간(ttl) 동안 최대 n개(maxsize)의 결과를 서버 메모리에 들고 있습니다.
 # ==============================================================================
-# 뉴스 & 퀀트 대시보드 데이터: 10분(600초) 캐시
-news_cache = TTLCache(maxsize=5, ttl=600)
-quant_cache = TTLCache(maxsize=5, ttl=600)
+news_cache = TTLCache(maxsize=5, ttl=600)       # 10분
+quant_cache = TTLCache(maxsize=5, ttl=600)      # 10분
+krx_cache = TTLCache(maxsize=5, ttl=86400)      # 24시간
+funda_all_cache = TTLCache(maxsize=5, ttl=3600) # 전체 펀더멘털 리스트 (1시간)
 
-# 종목 검색용 KRX 리스트: 하루(86400초) 캐시
-krx_cache = TTLCache(maxsize=5, ttl=86400)
-
-# 💡 [추가] 개별 종목 펀더멘털 데이터 캐시 (1시간 유지)
-# 네이버 실시간 스크래핑 부하를 막기 위해 최대 200개 종목의 펀더멘털을 1시간 동안 RAM에 기억합니다.
-funda_cache = TTLCache(maxsize=200, ttl=3600)
+# 💡 펀더멘털 단건 캐시 (DB/네이버 조회 방지용) - 용량을 3000개로 넉넉히!
+funda_cache = TTLCache(maxsize=3000, ttl=3600)
 
 
 # ==============================================================================
-# 📰 1. 마켓 뉴스 데스크 API (10분 캐시 적용)
+# 📰 1. 마켓 뉴스 데스크 API
 # ==============================================================================
 @app.get("/api/news")
 @cached(cache=news_cache)
 def get_news(limit: int = 500, refresh: str = "false"):
     if refresh.lower() == "true":
         news_cache.clear()
-        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("market_news").select("*").order("created_at", desc=True).limit(limit).execute()
@@ -70,25 +65,17 @@ def get_news(limit: int = 500, refresh: str = "false"):
 
 
 # ==============================================================================
-# 📈 2. 퀀트 데스크 전체 탭 데이터 통합 제공 API (10분 캐시 적용)
+# 📈 2. 퀀트 데스크 전체 탭 데이터 통합 제공 API
 # ==============================================================================
 @app.get("/api/quant-dashboard")
 @cached(cache=quant_cache)
 def get_quant_dashboard(refresh: str = "false"):
     if refresh.lower() == "true":
         quant_cache.clear()
-        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        data = {
-            "holdings": [],
-            "trades": [],
-            "history": [],
-            "confirmed": [],
-            "watchlist": []
-        }
+        data = {"holdings": [], "trades": [], "history": [], "confirmed": [], "watchlist": []}
 
-        # 1) 포트폴리오(캐시) 정보
         r1 = supabase.table("quant_screening_cache").select("id, results").in_("id", [11, 12, 13]).execute()
         if r1.data:
             for row in r1.data:
@@ -99,7 +86,6 @@ def get_quant_dashboard(refresh: str = "false"):
                     elif row["id"] == 13: data["history"] = res_json
                 except: pass
                 
-        # 2) 스크리닝(캐시) 정보
         r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2]).execute()
         if r2.data:
             for row in r2.data:
@@ -115,14 +101,13 @@ def get_quant_dashboard(refresh: str = "false"):
 
 
 # ==============================================================================
-# 🔍 3. 개별 종목 검색창 목록 제공 API (24시간 캐시 적용)
+# 🔍 3. 개별 종목 검색창 목록 제공 API
 # ==============================================================================
 @app.get("/api/krx-list")
 @cached(cache=krx_cache)
 def get_krx_list(refresh: str = "false"):
     if refresh.lower() == "true":
         krx_cache.clear()
-        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
@@ -134,7 +119,34 @@ def get_krx_list(refresh: str = "false"):
 
 
 # ==============================================================================
-# ⚡ 4. 실시간 개별 종목 분석 리포트 API (캐시 안 함 - 항상 최신)
+# 📊 4. [신규] 펀더멘털 전체 캐싱 로딩 API
+# ==============================================================================
+@app.get("/api/fundamentals")
+@cached(cache=funda_all_cache)
+def get_all_fundamentals(refresh: str = "false"):
+    """
+    화면 최초 접속 시 이 API를 호출하면, 
+    DB의 모든 펀더멘털을 백엔드 메모리(funda_cache)에 꽉꽉 채워넣어 검색 속도를 0초로 만듭니다.
+    """
+    if refresh.lower() == "true":
+        funda_all_cache.clear()
+    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    try:
+        # DB에서 수천 개의 펀더멘털 정보 일괄 조회
+        res = supabase.table("stock_fundamental").select("*").limit(3000).execute()
+        result_map = {}
+        if res.data:
+            for row in res.data:
+                sym = row["symbol"]
+                result_map[sym] = row
+                funda_cache[sym] = row  # 🌟 개별 종목 메모리 캐시에도 선제적으로 빵빵하게 채움!
+        return {"status": "success", "data": result_map}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ==============================================================================
+# ⚡ 5. 실시간 개별 종목 분석 리포트 API 
 # ==============================================================================
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str):
@@ -147,7 +159,6 @@ def search_stock(symbol: str):
         if df_price.empty:
             return {"status": "error", "message": "차트 데이터를 불러올 수 없습니다."}
 
-        # 1. 차트 데이터 정제 (최근 120일)
         chart_data = []
         df_recent = df_price.tail(120)
         for idx, row in df_recent.iterrows():
@@ -159,15 +170,14 @@ def search_stock(symbol: str):
         curr_price = int(df_price['Close'].iloc[-1])
         ret_1m = ((curr_price - df_price['Close'].iloc[-21]) / df_price['Close'].iloc[-21] * 100) if len(df_price) >= 21 else 0
 
-        # 💡 2. 펀더멘털 조회 (인메모리 캐시 확인 로직 추가)
+        # 💡 [핵심 최적화] 앞서 /api/fundamentals가 호출되었다면 RAM(funda_cache)에서 즉시 꺼내옴!
         if symbol in funda_cache:
             naver_fund = funda_cache[symbol]
         else:
             naver_fund = fetch_naver_fundamental(symbol)
             if naver_fund:
-                funda_cache[symbol] = naver_fund  # 캐시에 저장
-        
-        # 💡 [누락 복구] 빈 문자열 덮어쓰기 삭제! 네이버 펀더멘털에서 제대로 추출된 섹터 정보를 사용합니다.
+                funda_cache[symbol] = naver_fund
+                
         sector = naver_fund.get("sector", "") if naver_fund else ""
 
         metrics = calc_quant_metrics(df_price, naver_fund)
@@ -197,10 +207,7 @@ def search_stock(symbol: str):
             net_yoy = metrics.get("net_yoy", 0)
             score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, net_yoy/5)) + min(25, max(0, mom)))))
 
-        # 3. KOSPI 면 마켓 등 정보 수정
         market = "KOSPI"
-        
-        # krx list에서 종목명 등 조회 시도
         r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
         stock_name = symbol
         if r_krx.data:
@@ -208,7 +215,6 @@ def search_stock(symbol: str):
             matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
             if matched:
                 stock_name = matched.get("Name", symbol)
-                # 💡 [추가] 마스터 데이터에 Market 정보가 있다면 KOSDAQ 등으로 맵핑
                 market = matched.get("Market", "KOSPI")
 
         result_data = {
@@ -221,19 +227,19 @@ def search_stock(symbol: str):
             "fundamental": naver_fund,
             "chart_data": chart_data,
             "market": market,
-            "sector": sector  # 🌟 제대로 할당된 섹터 변수가 응답 JSON에 들어갑니다!
+            "sector": sector
         }
 
         return {"status": "success", "data": result_data}
 
     except Exception as e:
         import traceback
-        traceback.print_exc()  # 렌더(Render) 로그 확인용
+        traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
 
 # ==============================================================================
-# 🏢 5. 부동산 아파트 실거래가 스캔 API (스트리밍 파싱)
+# 🏢 6. 부동산 아파트 실거래가 스캔 API (스트리밍 파싱)
 # ==============================================================================
 class RealEstateRequest(BaseModel):
     api_key: str
