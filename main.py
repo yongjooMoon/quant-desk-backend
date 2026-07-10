@@ -121,7 +121,8 @@ def get_krx_list(refresh: str = "false"):
         
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        res = supabase.table("quant_screening_cache").select("id, results").eq("id", 99).execute()
+        # 💡 [원상 복구 완료] 에러를 피하기 위해 가장 잘 돌아가던 초기 버전의 쿼리로 되돌렸습니다.
+        res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
         if res.data:
             return {"status": "success", "data": json.loads(res.data[0]["results"])}
         return {"status": "success", "data": []}
@@ -158,13 +159,13 @@ def search_stock(symbol: str):
         # 2. 펀더멘털 조회 (실시간)
         naver_fund = fetch_naver_fundamental(symbol)
         
-        # 💡 [버그 픽스 완료] 원본 로직대로 calc_quant_metrics는 2개 인자만 넘깁니다.
+        # 💡 [핵심 버그 수정 완료] calc_quant_metrics는 metrics dict 딱 1개만 반환하도록 quant_core.py와 맞췄습니다!
         metrics = calc_quant_metrics(df_price, naver_fund)
         
         score = 0.0
         gates = {}
         
-        # 💡 지표(metrics)를 기반으로 직접 6대 관문과 랭킹 스코어를 계산합니다.
+        # 💡 [원상 복구 완료] 지표(metrics)를 기반으로 직접 6대 관문과 랭킹 스코어를 계산합니다.
         if metrics and metrics.get("ma20", 0) > 0:
             f_growth = bool(metrics["growth_composite"] > 0)
             f_mdd    = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
