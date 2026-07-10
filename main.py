@@ -44,15 +44,19 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL els
 news_cache = TTLCache(maxsize=5, ttl=600)
 quant_cache = TTLCache(maxsize=5, ttl=600)
 
-# 종목 검색용 KRX 리스트: 하루(86400초) 캐시 (이건 하루에 한 번만 바뀌면 충분함)
+# 종목 검색용 KRX 리스트: 하루(86400초) 캐시
 krx_cache = TTLCache(maxsize=5, ttl=86400)
+
+# 💡 [추가] 개별 종목 펀더멘털 데이터 캐시 (1시간 유지)
+# 네이버 실시간 스크래핑 부하를 막기 위해 최대 200개 종목의 펀더멘털을 1시간 동안 RAM에 기억합니다.
+funda_cache = TTLCache(maxsize=200, ttl=3600)
 
 
 # ==============================================================================
 # 📰 1. 마켓 뉴스 데스크 API (10분 캐시 적용)
 # ==============================================================================
 @app.get("/api/news")
-@cached(cache=news_cache) # 💡 사용자가 아무리 클릭해도 10분 내에는 DB 안 가고 RAM에서 즉시 반환
+@cached(cache=news_cache)
 def get_news(limit: int = 500, refresh: str = "false"):
     if refresh.lower() == "true":
         news_cache.clear()
@@ -69,7 +73,7 @@ def get_news(limit: int = 500, refresh: str = "false"):
 # 📈 2. 퀀트 데스크 전체 탭 데이터 통합 제공 API (10분 캐시 적용)
 # ==============================================================================
 @app.get("/api/quant-dashboard")
-@cached(cache=quant_cache) # 💡 퀀트 화면 이동 시, 동기화 버튼 클릭 시에도 10분간은 번개처럼 로딩
+@cached(cache=quant_cache)
 def get_quant_dashboard(refresh: str = "false"):
     if refresh.lower() == "true":
         quant_cache.clear()
@@ -114,14 +118,13 @@ def get_quant_dashboard(refresh: str = "false"):
 # 🔍 3. 개별 종목 검색창 목록 제공 API (24시간 캐시 적용)
 # ==============================================================================
 @app.get("/api/krx-list")
-@cached(cache=krx_cache) # 💡 종목 검색 드롭다운은 24시간 내내 DB를 안 거치고 즉각 튀어나옴
+@cached(cache=krx_cache)
 def get_krx_list(refresh: str = "false"):
     if refresh.lower() == "true":
         krx_cache.clear()
         
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        # 💡 [원상 복구 완료] 에러를 피하기 위해 가장 잘 돌아가던 초기 버전의 쿼리로 되돌렸습니다.
         res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
         if res.data:
             return {"status": "success", "data": json.loads(res.data[0]["results"])}
@@ -137,17 +140,6 @@ def get_krx_list(refresh: str = "false"):
 def search_stock(symbol: str):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        # 💡 [개선] krx list에서 종목명 및 KOSPI/KOSDAQ 마켓 정보 미리 조회
-        r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
-        stock_name = symbol
-        market = "KOSPI"
-        if r_krx.data:
-            krx_list = json.loads(r_krx.data[0]["results"])
-            matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
-            if matched:
-                stock_name = matched.get("Name", symbol)
-                market = matched.get("Market", "KOSPI")
-
         df_price = load_price_from_db(supabase, symbol)
         if df_price.empty:
             df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
@@ -167,26 +159,17 @@ def search_stock(symbol: str):
         curr_price = int(df_price['Close'].iloc[-1])
         ret_1m = ((curr_price - df_price['Close'].iloc[-21]) / df_price['Close'].iloc[-21] * 100) if len(df_price) >= 21 else 0
 
-        # 2. 펀더멘털 조회 (💡 [핵심 최적화] DB 캐시 우선 확인, 없거나 누락 시 실시간 스크래핑 후 DB 저장)
-        naver_fund = load_fundamental_from_db(supabase, symbol)
-        required_keys = ['op_margin', 'roa', 'per', 'pbr', 'marcap_억', 'sector']
-        needs_update = not naver_fund or any(naver_fund.get(k) is None for k in required_keys)
+        # 💡 2. 펀더멘털 조회 (인메모리 캐시 확인 로직 추가)
+        if symbol in funda_cache:
+            naver_fund = funda_cache[symbol]
+        else:
+            naver_fund = fetch_naver_fundamental(symbol)
+            if naver_fund:
+                funda_cache[symbol] = naver_fund  # 캐시에 저장
         
-        if needs_update:
-            scraped_fund = fetch_naver_fundamental(symbol)
-            if not naver_fund: naver_fund = {}
-            for k, v in scraped_fund.items():
-                if v is not None:
-                    naver_fund[k] = v
-            try:
-                save_fundamental_to_db(supabase, symbol, stock_name, naver_fund)
-            except:
-                pass
-        
-        # 💡 [버그 픽스] 빈 문자열 덮어쓰기 삭제! 네이버나 DB에서 가져온 실제 섹터를 사용합니다.
-        sector = naver_fund.get("sector", "")
-        
-        # 3. 퀀트 스코어 및 관문 평가
+        # 💡 [누락 복구] 빈 문자열 덮어쓰기 삭제! 네이버 펀더멘털에서 제대로 추출된 섹터 정보를 사용합니다.
+        sector = naver_fund.get("sector", "") if naver_fund else ""
+
         metrics = calc_quant_metrics(df_price, naver_fund)
         
         score = 0.0
@@ -214,6 +197,20 @@ def search_stock(symbol: str):
             net_yoy = metrics.get("net_yoy", 0)
             score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, net_yoy/5)) + min(25, max(0, mom)))))
 
+        # 3. KOSPI 면 마켓 등 정보 수정
+        market = "KOSPI"
+        
+        # krx list에서 종목명 등 조회 시도
+        r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
+        stock_name = symbol
+        if r_krx.data:
+            krx_list = json.loads(r_krx.data[0]["results"])
+            matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
+            if matched:
+                stock_name = matched.get("Name", symbol)
+                # 💡 [추가] 마스터 데이터에 Market 정보가 있다면 KOSDAQ 등으로 맵핑
+                market = matched.get("Market", "KOSPI")
+
         result_data = {
             "symbol": symbol,
             "name": stock_name,
@@ -224,7 +221,7 @@ def search_stock(symbol: str):
             "fundamental": naver_fund,
             "chart_data": chart_data,
             "market": market,
-            "sector": sector
+            "sector": sector  # 🌟 제대로 할당된 섹터 변수가 응답 JSON에 들어갑니다!
         }
 
         return {"status": "success", "data": result_data}
@@ -233,6 +230,7 @@ def search_stock(symbol: str):
         import traceback
         traceback.print_exc()  # 렌더(Render) 로그 확인용
         return {"status": "error", "message": str(e)}
+
 
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (스트리밍 파싱)
