@@ -53,10 +53,7 @@ krx_cache = TTLCache(maxsize=5, ttl=86400)
 # ==============================================================================
 @app.get("/api/news")
 @cached(cache=news_cache) # 💡 사용자가 아무리 클릭해도 10분 내에는 DB 안 가고 RAM에서 즉시 반환
-def get_news(limit: int = 500, refresh: str = "false"):
-    if refresh.lower() == "true":
-        news_cache.clear()
-        
+def get_news(limit: int = 500):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("market_news").select("*").order("created_at", desc=True).limit(limit).execute()
@@ -70,10 +67,7 @@ def get_news(limit: int = 500, refresh: str = "false"):
 # ==============================================================================
 @app.get("/api/quant-dashboard")
 @cached(cache=quant_cache) # 💡 퀀트 화면 이동 시, 동기화 버튼 클릭 시에도 10분간은 번개처럼 로딩
-def get_quant_dashboard(refresh: str = "false"):
-    if refresh.lower() == "true":
-        quant_cache.clear()
-        
+def get_quant_dashboard():
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         data = {
@@ -85,8 +79,7 @@ def get_quant_dashboard(refresh: str = "false"):
         }
 
         # 1) 포트폴리오(캐시) 정보
-        # 💡 원본 로직 완벽 복구: 리스트 안에서 돌면서 JSON 파싱
-        r1 = supabase.table("quant_screening_cache").select("id, results").in_("id", [11, 12, 13]).execute()
+        r1 = supabase.table("quant_screening_cache").select("results").in_("id", [11, 12, 13]).execute()
         if r1.data:
             for row in r1.data:
                 try:
@@ -97,7 +90,7 @@ def get_quant_dashboard(refresh: str = "false"):
                 except: pass
                 
         # 2) 스크리닝(캐시) 정보
-        r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2]).execute()
+        r2 = supabase.table("quant_screening_cache").select("results").in_("id", [1, 2]).execute()
         if r2.data:
             for row in r2.data:
                 try:
@@ -116,10 +109,7 @@ def get_quant_dashboard(refresh: str = "false"):
 # ==============================================================================
 @app.get("/api/krx-list")
 @cached(cache=krx_cache) # 💡 종목 검색 드롭다운은 24시간 내내 DB를 안 거치고 즉각 튀어나옴
-def get_krx_list(refresh: str = "false"):
-    if refresh.lower() == "true":
-        krx_cache.clear()
-        
+def get_krx_list():
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
@@ -159,8 +149,8 @@ def search_stock(symbol: str):
         # 2. 펀더멘털 및 스코어 (실시간)
         naver_fund = fetch_naver_fundamental(symbol)
         
-        # 💡 원본 로직 완벽 복구: calc_quant_metrics를 사용하도록 되돌림!
-        score, gates = calc_quant_metrics(df_price, naver_fund, curr_price)
+        from quant_core import evaluate_stock_score
+        score, gates = evaluate_stock_score(df_price, naver_fund, curr_price)
 
         # 3. KOSPI 면 마켓 등 정보 수정
         market = "KOSPI"
