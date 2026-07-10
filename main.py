@@ -53,7 +53,10 @@ krx_cache = TTLCache(maxsize=5, ttl=86400)
 # ==============================================================================
 @app.get("/api/news")
 @cached(cache=news_cache) # 💡 사용자가 아무리 클릭해도 10분 내에는 DB 안 가고 RAM에서 즉시 반환
-def get_news(limit: int = 500):
+def get_news(limit: int = 500, refresh: str = "false"):
+    if refresh.lower() == "true":
+        news_cache.clear()
+        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("market_news").select("*").order("created_at", desc=True).limit(limit).execute()
@@ -67,7 +70,10 @@ def get_news(limit: int = 500):
 # ==============================================================================
 @app.get("/api/quant-dashboard")
 @cached(cache=quant_cache) # 💡 퀀트 화면 이동 시, 동기화 버튼 클릭 시에도 10분간은 번개처럼 로딩
-def get_quant_dashboard():
+def get_quant_dashboard(refresh: str = "false"):
+    if refresh.lower() == "true":
+        quant_cache.clear()
+        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         data = {
@@ -79,7 +85,7 @@ def get_quant_dashboard():
         }
 
         # 1) 포트폴리오(캐시) 정보
-        r1 = supabase.table("quant_screening_cache").select("results").in_("id", [11, 12, 13]).execute()
+        r1 = supabase.table("quant_screening_cache").select("id, results").in_("id", [11, 12, 13]).execute()
         if r1.data:
             for row in r1.data:
                 try:
@@ -90,7 +96,7 @@ def get_quant_dashboard():
                 except: pass
                 
         # 2) 스크리닝(캐시) 정보
-        r2 = supabase.table("quant_screening_cache").select("results").in_("id", [1, 2]).execute()
+        r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2]).execute()
         if r2.data:
             for row in r2.data:
                 try:
@@ -109,10 +115,13 @@ def get_quant_dashboard():
 # ==============================================================================
 @app.get("/api/krx-list")
 @cached(cache=krx_cache) # 💡 종목 검색 드롭다운은 24시간 내내 DB를 안 거치고 즉각 튀어나옴
-def get_krx_list():
+def get_krx_list(refresh: str = "false"):
+    if refresh.lower() == "true":
+        krx_cache.clear()
+        
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
+        res = supabase.table("quant_screening_cache").select("id, results").eq("id", 99).execute()
         if res.data:
             return {"status": "success", "data": json.loads(res.data[0]["results"])}
         return {"status": "success", "data": []}
@@ -146,11 +155,37 @@ def search_stock(symbol: str):
         curr_price = int(df_price['Close'].iloc[-1])
         ret_1m = ((curr_price - df_price['Close'].iloc[-21]) / df_price['Close'].iloc[-21] * 100) if len(df_price) >= 21 else 0
 
-        # 2. 펀더멘털 및 스코어 (실시간)
+        # 2. 펀더멘털 조회 (실시간)
         naver_fund = fetch_naver_fundamental(symbol)
         
-        from quant_core import evaluate_stock_score
-        score, gates = evaluate_stock_score(df_price, naver_fund, curr_price)
+        # 💡 [버그 픽스 완료] 원본 로직대로 calc_quant_metrics는 2개 인자만 넘깁니다.
+        metrics = calc_quant_metrics(df_price, naver_fund)
+        
+        score = 0.0
+        gates = {}
+        
+        # 💡 지표(metrics)를 기반으로 직접 6대 관문과 랭킹 스코어를 계산합니다.
+        if metrics and metrics.get("ma20", 0) > 0:
+            f_growth = bool(metrics["growth_composite"] > 0)
+            f_mdd    = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
+            f_liq    = bool(metrics["liquidity_20d"] >= 50)
+            f_trend  = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]))
+            f_break  = bool(curr_price >= (metrics["high_60d"] * 0.90))
+            f_vol    = bool(metrics["vol_5d"] > (metrics["vol_60d"] * 1.5))
+
+            gates = {
+                'A': {'name': 'Growth Composite', 'pass': f_growth, 'reason': f"Comp {metrics.get('growth_composite',0):+.1f}%"},
+                'B': {'name': 'Dynamic MDD', 'pass': f_mdd, 'reason': f"MDD {metrics.get('mdd',0):.1f}% (Limit: {metrics.get('dynamic_mdd_limit',0):.1f}%)"},
+                'C': {'name': 'Liquidity', 'pass': f_liq, 'reason': f"{metrics.get('liquidity_20d',0):,.0f}억"},
+                'D': {'name': 'Trend Alignment', 'pass': f_trend, 'reason': "Price > 20MA > 60MA" if f_trend else "추세 미달"},
+                'E': {'name': 'Price Breakout', 'pass': f_break, 'reason': f"고점대비 {(curr_price/metrics.get('high_60d',1))*100:.1f}%" if metrics.get('high_60d') else "-"},
+                'F': {'name': 'Volume Surge', 'pass': f_vol, 'reason': f"Vol {metrics.get('vol_5d',0)/metrics.get('vol_60d',1):.1f}x 급증" if metrics.get('vol_60d') else "-"}
+            }
+
+            pass_count = sum([1 for g in gates.values() if g['pass']])
+            mom = ((curr_price - metrics["ma60"]) / metrics["ma60"] * 100) if metrics["ma60"] > 0 else 0
+            net_yoy = metrics.get("net_yoy", 0)
+            score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, net_yoy/5)) + min(25, max(0, mom)))))
 
         # 3. KOSPI 면 마켓 등 정보 수정
         market = "KOSPI"
@@ -164,7 +199,6 @@ def search_stock(symbol: str):
             matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
             if matched:
                 stock_name = matched.get("Name", symbol)
-                # 만약 캐시 내에 마켓, 섹터 정보가 있다면 반영 (현재는 SearchStr 등만 있음)
 
         result_data = {
             "symbol": symbol,
@@ -182,6 +216,8 @@ def search_stock(symbol: str):
         return {"status": "success", "data": result_data}
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # 렌더(Render) 로그 확인용
         return {"status": "error", "message": str(e)}
 
 
