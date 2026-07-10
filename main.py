@@ -10,7 +10,7 @@ import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 import asyncio
 from typing import Optional, List
-from cachetools import TTLCache, cached  # 🌟 캐시 라이브러리
+from cachetools import TTLCache, cached  # 🌟 캐시 라이브러리 추가
 
 # 기존 quant_core 및 real_estate 모듈 활용
 from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst
@@ -22,7 +22,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 🌟 Vercel 등 모든 프론트엔드 도메인 허용
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,21 +38,22 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL els
 
 # ==============================================================================
 # 🌟 인메모리(RAM) 캐시 설정
+# TTLCache: 정해진 시간(ttl) 동안 최대 n개(maxsize)의 결과를 서버 메모리에 들고 있습니다.
 # ==============================================================================
-# 뉴스 & 퀀트 데이터: 10분(600초) 캐시
+# 뉴스 & 퀀트 대시보드 데이터: 10분(600초) 캐시
 news_cache = TTLCache(maxsize=5, ttl=600)
 quant_cache = TTLCache(maxsize=5, ttl=600)
-# 종목 검색용 KRX 리스트: 하루(86400초) 캐시
+
+# 종목 검색용 KRX 리스트: 하루(86400초) 캐시 (이건 하루에 한 번만 바뀌면 충분함)
 krx_cache = TTLCache(maxsize=5, ttl=86400)
 
 
 # ==============================================================================
-# 📰 1. 마켓 뉴스 데스크 API
+# 📰 1. 마켓 뉴스 데스크 API (10분 캐시 적용)
 # ==============================================================================
 @app.get("/api/news")
-@cached(cache=news_cache) 
+@cached(cache=news_cache) # 💡 사용자가 아무리 클릭해도 10분 내에는 DB 안 가고 RAM에서 즉시 반환
 def get_news(limit: int = 500):
-    print("🟢 [CACHE MISS] DB에서 뉴스 데이터를 새로 가져옵니다!") # 💡 작동 확인용 로그
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("market_news").select("*").order("created_at", desc=True).limit(limit).execute()
@@ -62,12 +63,11 @@ def get_news(limit: int = 500):
 
 
 # ==============================================================================
-# 📈 2. 퀀트 데스크 전체 탭 데이터
+# 📈 2. 퀀트 데스크 전체 탭 데이터 통합 제공 API (10분 캐시 적용)
 # ==============================================================================
 @app.get("/api/quant-dashboard")
-@cached(cache=quant_cache) 
+@cached(cache=quant_cache) # 💡 퀀트 화면 이동 시, 동기화 버튼 클릭 시에도 10분간은 번개처럼 로딩
 def get_quant_dashboard():
-    print("🟢 [CACHE MISS] DB에서 퀀트 대시보드 데이터를 새로 가져옵니다!") # 💡 작동 확인용 로그
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         data = {
@@ -78,7 +78,9 @@ def get_quant_dashboard():
             "watchlist": []
         }
 
-        r1 = supabase.table("quant_screening_cache").select("results").in_("id", [11, 12, 13]).execute()
+        # 1) 포트폴리오(캐시) 정보
+        # 💡 [버그수정] select("id, results")로 id를 같이 가져와야 매핑이 정상 작동합니다!
+        r1 = supabase.table("quant_screening_cache").select("id, results").in_("id", [11, 12, 13]).execute()
         if r1.data:
             for row in r1.data:
                 try:
@@ -88,7 +90,9 @@ def get_quant_dashboard():
                     elif row["id"] == 13: data["history"] = res_json
                 except: pass
                 
-        r2 = supabase.table("quant_screening_cache").select("results").in_("id", [1, 2]).execute()
+        # 2) 스크리닝(캐시) 정보
+        # 💡 [버그수정] select("id, results")로 id를 같이 가져옵니다.
+        r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2]).execute()
         if r2.data:
             for row in r2.data:
                 try:
@@ -103,12 +107,11 @@ def get_quant_dashboard():
 
 
 # ==============================================================================
-# 🔍 3. 개별 종목 검색창 목록
+# 🔍 3. 개별 종목 검색창 목록 제공 API (24시간 캐시 적용)
 # ==============================================================================
 @app.get("/api/krx-list")
-@cached(cache=krx_cache) 
+@cached(cache=krx_cache) # 💡 종목 검색 드롭다운은 24시간 내내 DB를 안 거치고 즉각 튀어나옴
 def get_krx_list():
-    print("🟢 [CACHE MISS] DB에서 KRX 종목 리스트를 새로 가져옵니다!") # 💡 작동 확인용 로그
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
@@ -163,6 +166,7 @@ def search_stock(symbol: str):
             matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
             if matched:
                 stock_name = matched.get("Name", symbol)
+                # 만약 캐시 내에 마켓, 섹터 정보가 있다면 반영 (현재는 SearchStr 등만 있음)
 
         result_data = {
             "symbol": symbol,
