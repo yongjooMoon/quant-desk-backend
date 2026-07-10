@@ -13,7 +13,7 @@ from typing import Optional, List
 from cachetools import TTLCache, cached  # 🌟 캐시 라이브러리 추가
 
 # 기존 quant_core 및 real_estate 모듈 활용
-from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst
+from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
 from real_estate import generate_excel_data
 
 load_dotenv()
@@ -137,6 +137,17 @@ def get_krx_list(refresh: str = "false"):
 def search_stock(symbol: str):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
+        # 💡 [개선] krx list에서 종목명 및 KOSPI/KOSDAQ 마켓 정보 미리 조회
+        r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
+        stock_name = symbol
+        market = "KOSPI"
+        if r_krx.data:
+            krx_list = json.loads(r_krx.data[0]["results"])
+            matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
+            if matched:
+                stock_name = matched.get("Name", symbol)
+                market = matched.get("Market", "KOSPI")
+
         df_price = load_price_from_db(supabase, symbol)
         if df_price.empty:
             df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
@@ -156,16 +167,31 @@ def search_stock(symbol: str):
         curr_price = int(df_price['Close'].iloc[-1])
         ret_1m = ((curr_price - df_price['Close'].iloc[-21]) / df_price['Close'].iloc[-21] * 100) if len(df_price) >= 21 else 0
 
-        # 2. 펀더멘털 조회 (실시간)
-        naver_fund = fetch_naver_fundamental(symbol)
+        # 2. 펀더멘털 조회 (💡 [핵심 최적화] DB 캐시 우선 확인, 없거나 누락 시 실시간 스크래핑 후 DB 저장)
+        naver_fund = load_fundamental_from_db(supabase, symbol)
+        required_keys = ['op_margin', 'roa', 'per', 'pbr', 'marcap_억', 'sector']
+        needs_update = not naver_fund or any(naver_fund.get(k) is None for k in required_keys)
         
-        # 💡 [핵심 버그 수정 완료] calc_quant_metrics는 metrics dict 딱 1개만 반환하도록 quant_core.py와 맞췄습니다!
+        if needs_update:
+            scraped_fund = fetch_naver_fundamental(symbol)
+            if not naver_fund: naver_fund = {}
+            for k, v in scraped_fund.items():
+                if v is not None:
+                    naver_fund[k] = v
+            try:
+                save_fundamental_to_db(supabase, symbol, stock_name, naver_fund)
+            except:
+                pass
+        
+        # 💡 [버그 픽스] 빈 문자열 덮어쓰기 삭제! 네이버나 DB에서 가져온 실제 섹터를 사용합니다.
+        sector = naver_fund.get("sector", "")
+        
+        # 3. 퀀트 스코어 및 관문 평가
         metrics = calc_quant_metrics(df_price, naver_fund)
         
         score = 0.0
         gates = {}
         
-        # 💡 [원상 복구 완료] 지표(metrics)를 기반으로 직접 6대 관문과 랭킹 스코어를 계산합니다.
         if metrics and metrics.get("ma20", 0) > 0:
             f_growth = bool(metrics["growth_composite"] > 0)
             f_mdd    = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
@@ -188,19 +214,6 @@ def search_stock(symbol: str):
             net_yoy = metrics.get("net_yoy", 0)
             score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, net_yoy/5)) + min(25, max(0, mom)))))
 
-        # 3. KOSPI 면 마켓 등 정보 수정
-        market = "KOSPI"
-        sector = ""
-        
-        # krx list에서 종목명 등 조회 시도
-        r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
-        stock_name = symbol
-        if r_krx.data:
-            krx_list = json.loads(r_krx.data[0]["results"])
-            matched = next((item for item in krx_list if item["Symbol"] == symbol), None)
-            if matched:
-                stock_name = matched.get("Name", symbol)
-
         result_data = {
             "symbol": symbol,
             "name": stock_name,
@@ -220,7 +233,6 @@ def search_stock(symbol: str):
         import traceback
         traceback.print_exc()  # 렌더(Render) 로그 확인용
         return {"status": "error", "message": str(e)}
-
 
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (스트리밍 파싱)
