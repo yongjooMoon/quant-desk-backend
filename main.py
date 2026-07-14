@@ -391,10 +391,10 @@ async def scan_real_estate(req: RealEstateRequest):
 scheduler = BackgroundScheduler(timezone=KST)
 
 BATCH_WARMUP_TIMES = [
-    (8, 5),    # 08:02 배치 -> 08:05 예열
-    (14, 33),  # 14:30 배치 -> 14:33 예열
-    (16, 35),  # 16:32 배치 -> 16:35 예열
-    (23, 35),  # 23:32 배치 -> 23:35 예열
+    (8, 10),    # 08:02 배치 -> 08:10 예열
+    (14, 40),  # 14:30 배치 -> 14:40 예열
+    (16, 40),  # 16:32 배치 -> 16:40 예열
+    (23, 40),  # 23:32 배치 -> 23:40 예열
 ]
 
 def _warmup_all():
