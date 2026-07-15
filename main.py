@@ -14,6 +14,7 @@ import asyncio
 from typing import Optional, List
 from cachetools import TTLCache, cached  # KRX 리스트 등 순수 TTL이 맞는 곳엔 계속 사용
 from apscheduler.schedulers.background import BackgroundScheduler
+import pandas as pd
 
 # 기존 quant_core 및 real_estate 모듈 활용
 from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
@@ -239,7 +240,7 @@ def get_krx_list(refresh: str = "false"):
 # ⚡ 4. 실시간 개별 종목 분석 리포트 API (1분 스마트 캐시 & 미국 지수 지원)
 # ==============================================================================
 @app.get("/api/search/{symbol}")
-def search_stock(symbol: str):
+def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
 
     # 🌟 1. 1분 TTL 스마트 캐싱 (프론트가 1분마다 폴링해도 외부 API 부하 0)
@@ -247,9 +248,26 @@ def search_stock(symbol: str):
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
 
     try:
-        df_price = load_price_from_db(supabase, symbol)
-        if df_price.empty:
-            df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
+        # 🌟 2. 지수(Index) 판단 로직 - 지수면 DB 과거 데이터 로드 스킵 & 야후파이낸스 실시간 조회 강제
+        is_index = symbol in ['KS11', 'KQ11', 'US500', 'IXIC', 'DJI']
+        
+        df_price = pd.DataFrame()
+        if is_index:
+            # 🚨 핵심: 지수는 DB에서 모의/과거 데이터를 가져오는 것을 원천 차단하고 무조건 실시간 조회!
+            # S&P500, NASDAQ 등은 차단 이슈가 있으므로 Yahoo Finance 티커로 우회 맵핑합니다.
+            yahoo_ticker_map = {'KS11': '^KS11', 'KQ11': '^KQ11', 'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
+            y_sym = yahoo_ticker_map.get(symbol, symbol)
+            try:
+                df_price = fdr.DataReader(y_sym, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
+            except:
+                try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
+                except: pass
+        else:
+            # 일반 종목은 기존대로 DB 우선 조회
+            df_price = load_price_from_db(supabase, symbol)
+            if df_price.empty:
+                try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
+                except: pass
 
         if df_price.empty:
             return {"status": "error", "message": "차트 데이터를 불러올 수 없습니다."}
