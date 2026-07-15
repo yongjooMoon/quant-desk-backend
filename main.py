@@ -59,10 +59,8 @@ quant_smart_cache = SmartCache()
 # 종목 검색용 KRX 리스트: 배치와 무관하게 거의 안 바뀌므로 기존 24시간 TTL 유지
 krx_cache = TTLCache(maxsize=5, ttl=86400)
 
-# 💡 [수정] 개별 종목 및 지수 캐시 (1분 유지) - 외부 API 호출 방어용
-# 지수 티커(KS11, US500 등) 폴링 시 과도한 외부 호출을 막기 위해 TTL을 60초로 설정합니다.
-funda_cache = TTLCache(maxsize=3000, ttl=60)
-
+# 💡 개별 종목 펀더멘털 데이터 및 지수 캐시 (50초 유지) - 브라우저 폴링(60초) 대비
+funda_cache = TTLCache(maxsize=3000, ttl=50)
 
 def _get_latest_news_ts():
     """market_news 테이블에서 가장 최신 created_at 하나만 가볍게 조회"""
@@ -243,8 +241,8 @@ def get_krx_list(refresh: str = "false"):
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
-    
-    # 🌟 [추가] 1. 1분 TTL 스마트 캐싱 (프론트가 1분마다 폴링해도 외부 API 부하 0)
+
+    # 🌟 1. 1분 TTL 스마트 캐싱 (프론트가 1분마다 폴링해도 외부 API 부하 0)
     if symbol in funda_cache:
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
 
@@ -266,21 +264,18 @@ def search_stock(symbol: str):
             })
 
         curr_price = float(df_price['Close'].iloc[-1])
-        
-        # 수익률 계산 (안전하게 처리)
+
+        # 당일/1개월 수익률 계산
         ret_1d = 0.0
         ret_1m = 0.0
         if len(df_price) >= 2:
-            prev_1d = float(df_price['Close'].iloc[-2])
-            ret_1d = ((curr_price - prev_1d) / prev_1d * 100) if prev_1d > 0 else 0.0
-            
+            ret_1d = ((curr_price - float(df_price['Close'].iloc[-2])) / float(df_price['Close'].iloc[-2]) * 100)
         if len(df_price) >= 21:
-            prev_1m = float(df_price['Close'].iloc[-21])
-            ret_1m = ((curr_price - prev_1m) / prev_1m * 100) if prev_1m > 0 else 0.0
+            ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
 
-        # 🌟 [수정] 2. 지수(Index) 판단 로직 - 지수면 펀더멘털 스킵
+        # 🌟 2. 지수(Index) 판단 로직 - 지수면 펀더멘털 스킵
         is_index = symbol in ['KS11', 'KQ11', 'US500', 'IXIC', 'DJI']
-        
+
         naver_fund = {}
         sector = ""
         score = 0.0
@@ -289,15 +284,14 @@ def search_stock(symbol: str):
         stock_name = symbol
 
         if is_index:
-            # 지수인 경우 맵핑 (네이버 펀더멘털 등은 조회하지 않음)
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
             stock_name = index_names.get(symbol, symbol)
             market = "Index"
             sector = "지수"
         else:
-            # 일반 종목인 경우 기존 펀더멘털 및 스코어 계산 로직 그대로 수행
             naver_fund = fetch_naver_fundamental(symbol)
             sector = naver_fund.get("sector", "") if naver_fund else ""
+
             metrics = calc_quant_metrics(df_price, naver_fund)
 
             if metrics and metrics.get("ma20", 0) > 0:
@@ -335,7 +329,7 @@ def search_stock(symbol: str):
             "symbol": symbol,
             "name": stock_name,
             "current_price": curr_price,
-            "ret_1d": ret_1d, # 지수 티커 표시용 당일 수익률
+            "ret_1d": ret_1d, # 🌟 지수 티커용
             "ret_1m": ret_1m,
             "score": score,
             "gates": gates,
@@ -344,11 +338,11 @@ def search_stock(symbol: str):
             "market": market,
             "sector": sector
         }
-        
-        # 🌟 계산이 끝난 결과물을 1분 동안 메모리(funda_cache)에 저장
+
+        # 🌟 계산 결과를 캐시에 저장
         funda_cache[symbol] = result_data
 
-        return {"status": "success", "data": result_data, "cached": False}
+        return {"status": "success", "data": result_data}
 
     except Exception as e:
         import traceback
