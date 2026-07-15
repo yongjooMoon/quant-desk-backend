@@ -15,6 +15,7 @@ from typing import Optional, List
 from cachetools import TTLCache, cached  # KRX 리스트 등 순수 TTL이 맞는 곳엔 계속 사용
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
+import urllib.request  # 🌟 야후 파이낸스 다이렉트 호출용 추가
 
 # 기존 quant_core 및 real_estate 모듈 활용
 from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
@@ -253,14 +254,26 @@ def search_stock(symbol: str, t: Optional[str] = None):
         
         df_price = pd.DataFrame()
         if is_index:
-            # 🚨 핵심: 지수는 DB에서 모의/과거 데이터를 가져오는 것을 원천 차단하고 무조건 실시간 조회!
-            # S&P500, NASDAQ 등은 차단 이슈가 있으므로 Yahoo Finance 티커로 우회 맵핑합니다.
+            # 🚨 핵심: Investing.com 크롤링 차단(Hang)으로 인한 Failed to fetch 에러를 막기 위해
+            # 야후 파이낸스 차트 API를 다이렉트로 호출합니다.
             yahoo_ticker_map = {'KS11': '^KS11', 'KQ11': '^KQ11', 'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
             y_sym = yahoo_ticker_map.get(symbol, symbol)
+            
             try:
-                df_price = fdr.DataReader(y_sym, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
-            except:
-                try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    result = data['chart']['result'][0]
+                    timestamps = result['timestamp']
+                    closes = result['indicators']['quote'][0]['close']
+                    
+                    df_price = pd.DataFrame({'Close': closes}, index=pd.to_datetime(timestamps, unit='s', utc=True).tz_convert('Asia/Seoul'))
+                    df_price = df_price.dropna()
+            except Exception as e:
+                print(f"Yahoo Direct API Error: {e}")
+                # 최후의 보루 fdr
+                try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
                 except: pass
         else:
             # 일반 종목은 기존대로 DB 우선 조회
@@ -292,8 +305,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
             ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
 
         # 🌟 2. 지수(Index) 판단 로직 - 지수면 펀더멘털 스킵
-        is_index = symbol in ['KS11', 'KQ11', 'US500', 'IXIC', 'DJI']
-
         naver_fund = {}
         sector = ""
         score = 0.0
