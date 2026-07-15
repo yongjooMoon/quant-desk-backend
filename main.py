@@ -191,14 +191,17 @@ def search_stock(symbol: str, t: Optional[str] = None):
         curr_price, prev_close, ret_1d, ret_1m = 0.0, 0.0, 0.0, 0.0
         chart_data = []
         market_status = "장마감"
+        
+        # 야후 차단 회피용 강력한 헤더
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
         if is_index:
             if symbol in ['KS11', 'KQ11']:
-                # 🚨 한국 지수: 네이버 실시간 API로 공휴일 완벽 대응 및 정확한 종가 추출
+                # 🚨 한국 지수: 네이버 실시간 API
                 naver_sym = "KOSPI" if symbol == 'KS11' else "KOSDAQ"
                 try:
                     url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{naver_sym}"
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    req = urllib.request.Request(url, headers=headers)
                     with urllib.request.urlopen(req, timeout=5) as response:
                         data = json.loads(response.read().decode('utf-8'))
                         ds = data['datas'][0]
@@ -220,29 +223,24 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except: pass
 
             else:
-                # 🚨 미국 지수: 야후 파이낸스 현물(Spot) 티커로 원복! 본장 열렸을 때만 움직임.
+                # 🚨 미국 지수: 야후 현물(Spot)
                 yahoo_ticker_map = {'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
                 y_sym = yahoo_ticker_map.get(symbol, symbol)
                 
-                # Quote API를 통해 정확한 장중 상태(REGULAR/CLOSED) 파악
-                try:
-                    quote_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={y_sym}"
-                    req = urllib.request.Request(quote_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, timeout=5) as response:
-                        q_data = json.loads(response.read().decode('utf-8'))['quoteResponse']['result'][0]
-                        curr_price = float(q_data['regularMarketPrice'])
-                        ret_1d = float(q_data['regularMarketChangePercent'])
-                        m_stat = q_data.get('marketState', 'CLOSED')
-                        market_status = "장중" if m_stat == "REGULAR" else "장마감"
-                except Exception as e:
-                    print("Yahoo Quote error:", e)
-
-                # Chart API
+                # [수정됨] 1. 차트 API로 가격/수익률 우선 추출 (가장 안정적이고 차단이 적음)
                 try:
                     chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
-                    req = urllib.request.Request(chart_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    req = urllib.request.Request(chart_url, headers=headers)
                     with urllib.request.urlopen(req, timeout=5) as response:
                         c_data = json.loads(response.read().decode('utf-8'))['chart']['result'][0]
+                        
+                        # 0이 되지 않도록 여기서 가격 확정!
+                        meta = c_data['meta']
+                        curr_price = float(meta['regularMarketPrice'])
+                        prev_close = float(meta['chartPreviousClose'])
+                        if prev_close > 0:
+                            ret_1d = ((curr_price - prev_close) / prev_close) * 100
+                        
                         timestamps = c_data.get('timestamp', [])
                         closes = c_data['indicators']['quote'][0].get('close', [])
                         
@@ -256,6 +254,32 @@ def search_stock(symbol: str, t: Optional[str] = None):
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                 except Exception as e:
                     print("Yahoo Chart error:", e)
+                    # 최후의 보루: fdr
+                    try:
+                        df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
+                        if not df_price.empty:
+                            curr_price = float(df_price['Close'].iloc[-1])
+                            prev_close = float(df_price['Close'].iloc[-2])
+                            ret_1d = ((curr_price - prev_close) / prev_close) * 100
+                            if len(df_price) >= 21:
+                                ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
+                            for idx, row in df_price.tail(120).iterrows():
+                                chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
+                    except: pass
+
+                # [수정됨] 2. 상태 API 분리 (이게 차단당해서 에러가 나도 가격(curr_price)은 정상 반환됨!)
+                try:
+                    quote_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={y_sym}"
+                    req = urllib.request.Request(quote_url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        q_data = json.loads(response.read().decode('utf-8'))['quoteResponse']['result'][0]
+                        m_stat = q_data.get('marketState', 'CLOSED')
+                        market_status = "장중" if m_stat == "REGULAR" else "장마감"
+                except Exception as e:
+                    print("Yahoo Quote error (Market Status skipped):", e)
+                    # 야후가 상태를 막으면 한국시간 기준 밤10시~새벽5시를 장중으로 임시 판별
+                    now_h = now_kst().hour
+                    market_status = "장중" if (now_h >= 22 or now_h <= 5) else "장마감"
 
             # 지수(Index) 결과 포맷팅
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
@@ -271,7 +295,7 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 "chart_data": chart_data,
                 "market": "Index",
                 "sector": "지수",
-                "market_status": market_status # 🌟 API를 통한 정확한 휴장/개장 상태
+                "market_status": market_status
             }
             funda_cache[symbol] = result_data
             return {"status": "success", "data": result_data}
