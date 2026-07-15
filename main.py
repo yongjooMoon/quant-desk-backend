@@ -174,13 +174,13 @@ def get_krx_list(refresh: str = "false"):
 
 
 # ==============================================================================
-# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API (현물 지수 완벽 지원)
+# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API (네이버 금융 완벽 통일)
 # ==============================================================================
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
 
-    # 1. 50초 TTL 스마트 캐싱 (프론트가 1분마다 찔러도 증권사 API/DB 부하 0)
+    # 1. 50초 TTL 스마트 캐싱
     if symbol in funda_cache:
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
 
@@ -192,94 +192,51 @@ def search_stock(symbol: str, t: Optional[str] = None):
         chart_data = []
         market_status = "장마감"
         
-        # 야후 차단 회피용 강력한 헤더
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
         if is_index:
-            if symbol in ['KS11', 'KQ11']:
-                # 🚨 한국 지수: 네이버 실시간 API
-                naver_sym = "KOSPI" if symbol == 'KS11' else "KOSDAQ"
-                try:
-                    url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{naver_sym}"
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=5) as response:
-                        data = json.loads(response.read().decode('utf-8'))
-                        ds = data['datas'][0]
-                        curr_price = float(ds['closePrice'].replace(',', ''))
-                        ret_1d = float(ds['fluctuationsRatio'])
-                        m_stat = ds.get('marketStatus', 'CLOSE')
-                        market_status = "장중" if m_stat == "OPEN" else "장마감"
-                except Exception as e:
-                    print("Naver API error:", e)
+            # 🚨 야후 파이낸스 차단 문제를 원천 해결하기 위해 '네이버 금융' API로 100% 통합
+            naver_sym_map = {
+                'KS11': 'KOSPI', 
+                'KQ11': 'KOSDAQ', 
+                'US500': 'SPI@SPX', 
+                'IXIC': 'NAS@IXIC', 
+                'DJI': 'DJI@DJI'
+            }
+            n_sym = naver_sym_map.get(symbol, 'KOSPI')
+            
+            try:
+                # [1] 현재가, 수익률, 장중/장마감 상태 추출
+                url = f"https://m.stock.naver.com/api/index/{n_sym}/basic"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    curr_price = float(data['closePrice'].replace(',', ''))
+                    ret_1d = float(data['fluctuationsRatio'])
+                    m_stat = data.get('marketStatus', 'CLOSE')
+                    market_status = "장중" if m_stat == "OPEN" else "장마감"
 
-                # 차트 데이터용 (과거)
-                try:
-                    df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
-                    if not df_price.empty:
-                        if len(df_price) >= 21:
-                            ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
-                        for idx, row in df_price.tail(120).iterrows():
-                            chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
-                except: pass
+                # [2] 차트 데이터 (과거 120일) 추출
+                chart_url = f"https://m.stock.naver.com/api/index/{n_sym}/price?pageSize=120&page=1"
+                req_chart = urllib.request.Request(chart_url, headers=headers)
+                with urllib.request.urlopen(req_chart, timeout=5) as response:
+                    chart_resp = json.loads(response.read().decode('utf-8'))
+                    # 네이버는 최신 날짜가 앞에 오므로 내림차순 정렬을 오름차순으로 뒤집음
+                    chart_resp.reverse() 
+                    
+                    for row in chart_resp:
+                        chart_data.append({
+                            "date": row['localTrdDt'], 
+                            "price": float(row['closePrice'].replace(',', ''))
+                        })
+                    
+                    # 1개월 수익률 계산 (약 21영업일 전)
+                    if len(chart_data) >= 21:
+                        past_price = chart_data[-21]['price']
+                        ret_1m = ((curr_price - past_price) / past_price) * 100
 
-            else:
-                # 🚨 미국 지수: 야후 현물(Spot)
-                yahoo_ticker_map = {'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
-                y_sym = yahoo_ticker_map.get(symbol, symbol)
-                
-                # [수정됨] 1. 차트 API로 가격/수익률 우선 추출 (가장 안정적이고 차단이 적음)
-                try:
-                    chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
-                    req = urllib.request.Request(chart_url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=5) as response:
-                        c_data = json.loads(response.read().decode('utf-8'))['chart']['result'][0]
-                        
-                        # 0이 되지 않도록 여기서 가격 확정!
-                        meta = c_data['meta']
-                        curr_price = float(meta['regularMarketPrice'])
-                        prev_close = float(meta['chartPreviousClose'])
-                        if prev_close > 0:
-                            ret_1d = ((curr_price - prev_close) / prev_close) * 100
-                        
-                        timestamps = c_data.get('timestamp', [])
-                        closes = c_data['indicators']['quote'][0].get('close', [])
-                        
-                        if timestamps and closes:
-                            df_price = pd.DataFrame({'Close': closes}, index=pd.to_datetime(timestamps, unit='s', utc=True).tz_convert('Asia/Seoul'))
-                            df_price = df_price.dropna()
-                            if len(df_price) >= 21:
-                                ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
-                            
-                            for idx, row in df_price.tail(120).iterrows():
-                                chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
-                except Exception as e:
-                    print("Yahoo Chart error:", e)
-                    # 최후의 보루: fdr
-                    try:
-                        df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
-                        if not df_price.empty:
-                            curr_price = float(df_price['Close'].iloc[-1])
-                            prev_close = float(df_price['Close'].iloc[-2])
-                            ret_1d = ((curr_price - prev_close) / prev_close) * 100
-                            if len(df_price) >= 21:
-                                ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
-                            for idx, row in df_price.tail(120).iterrows():
-                                chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
-                    except: pass
-
-                # [수정됨] 2. 상태 API 분리 (이게 차단당해서 에러가 나도 가격(curr_price)은 정상 반환됨!)
-                try:
-                    quote_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={y_sym}"
-                    req = urllib.request.Request(quote_url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=3) as response:
-                        q_data = json.loads(response.read().decode('utf-8'))['quoteResponse']['result'][0]
-                        m_stat = q_data.get('marketState', 'CLOSED')
-                        market_status = "장중" if m_stat == "REGULAR" else "장마감"
-                except Exception as e:
-                    print("Yahoo Quote error (Market Status skipped):", e)
-                    # 야후가 상태를 막으면 한국시간 기준 밤10시~새벽5시를 장중으로 임시 판별
-                    now_h = now_kst().hour
-                    market_status = "장중" if (now_h >= 22 or now_h <= 5) else "장마감"
+            except Exception as e:
+                print("Naver Index API error:", e)
 
             # 지수(Index) 결과 포맷팅
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
