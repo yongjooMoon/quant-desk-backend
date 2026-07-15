@@ -212,6 +212,11 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except Exception as e:
                     print("Naver API error:", e)
 
+                # 🌟 KOSPI 장마감 시간 철통 방어 (네이버 API가 OPEN으로 버그를 낼 때 대비)
+                now_k = now_kst()
+                if now_k.weekday() >= 5 or now_k.hour < 9 or (now_k.hour == 15 and now_k.minute > 30) or now_k.hour > 15:
+                    market_status = "장마감"
+
                 # 차트 데이터용 (과거)
                 try:
                     df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
@@ -227,19 +232,34 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 yahoo_ticker_map = {'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
                 y_sym = yahoo_ticker_map.get(symbol, symbol)
                 
-                # [수정됨] 1. 차트 API로 가격/수익률 우선 추출 (가장 안정적이고 차단이 적음)
+                # 차트 API로 가격/수익률 우선 추출
                 try:
                     chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
                     req = urllib.request.Request(chart_url, headers=headers)
                     with urllib.request.urlopen(req, timeout=5) as response:
                         c_data = json.loads(response.read().decode('utf-8'))['chart']['result'][0]
                         
-                        # 0이 되지 않도록 여기서 가격 확정!
                         meta = c_data['meta']
                         curr_price = float(meta['regularMarketPrice'])
                         prev_close = float(meta['chartPreviousClose'])
                         if prev_close > 0:
                             ret_1d = ((curr_price - prev_close) / prev_close) * 100
+                        
+                        # 🌟 야후 메타데이터를 활용한 완벽한 '미장 장중/장마감' 판별 (서머타임/휴일 자동 계산됨)
+                        try:
+                            trading_periods = meta.get('currentTradingPeriod', {}).get('regular', {})
+                            start_ts = trading_periods.get('start', 0)
+                            end_ts = trading_periods.get('end', 0)
+                            now_ts = int(datetime.utcnow().timestamp())
+                            
+                            # 현재 UTC 시간이 오늘 정규장 시간 사이에 있는지 확인
+                            if start_ts <= now_ts < end_ts:
+                                market_status = "장중"
+                            else:
+                                market_status = "장마감"
+                        except Exception as e:
+                            print("US Market Status Parse Error:", e)
+                            market_status = "장마감"
                         
                         timestamps = c_data.get('timestamp', [])
                         closes = c_data['indicators']['quote'][0].get('close', [])
@@ -266,20 +286,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                             for idx, row in df_price.tail(120).iterrows():
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                     except: pass
-
-                # [수정됨] 2. 상태 API 분리 (이게 차단당해서 에러가 나도 가격(curr_price)은 정상 반환됨!)
-                try:
-                    quote_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={y_sym}"
-                    req = urllib.request.Request(quote_url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=3) as response:
-                        q_data = json.loads(response.read().decode('utf-8'))['quoteResponse']['result'][0]
-                        m_stat = q_data.get('marketState', 'CLOSED')
-                        market_status = "장중" if m_stat == "REGULAR" else "장마감"
-                except Exception as e:
-                    print("Yahoo Quote error (Market Status skipped):", e)
-                    # 야후가 상태를 막으면 한국시간 기준 밤10시~새벽5시를 장중으로 임시 판별
-                    now_h = now_kst().hour
-                    market_status = "장중" if (now_h >= 22 or now_h <= 5) else "장마감"
 
             # 지수(Index) 결과 포맷팅
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
