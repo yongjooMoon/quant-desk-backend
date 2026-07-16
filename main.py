@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import urllib.request
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -42,6 +42,82 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 KST = ZoneInfo("Asia/Seoul")
+
+# ==============================================================================
+# 📊 [신규] 모든 API 호출을 추적하는 로깅 미들웨어 (문지기)
+# ==============================================================================
+def get_geolocation_from_ip(ip: str):
+    """간단한 외부 API를 이용해 IP의 지역(국가/도시) 정보를 가져옵니다."""
+    try:
+        # 로컬 접속 제외
+        if ip in ["127.0.0.1", "localhost", "::1"]:
+            return "Local", "Local"
+            
+        url = f"http://ip-api.com/json/{ip}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=2) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data.get('status') == 'success':
+                return data.get('country', 'Unknown'), data.get('city', 'Unknown')
+    except Exception:
+        pass
+    return "Unknown", "Unknown"
+
+def _sync_log_visit(client_ip: str, referer: str, screen_id: str):
+    """DB에 접속 기록을 저장하거나 업데이트(Upsert)하는 실제 함수"""
+    if not supabase: return
+    country, city = get_geolocation_from_ip(client_ip)
+    try:
+        # 1. IP와 화면ID(API 주소) 조합이 존재하는지 확인
+        res = supabase.table("visitor_logs").select("visit_count").eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
+        
+        if res.data:
+            # 2. 존재하면 조회수(visit_count) + 1 로 업데이트
+            current_count = res.data[0]['visit_count']
+            supabase.table("visitor_logs").update({
+                "visit_count": current_count + 1,
+                "last_visit": "now()",
+                "referer": referer
+            }).eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
+        else:
+            # 3. 없으면 새로 삽입
+            supabase.table("visitor_logs").insert({
+                "ip_address": client_ip,
+                "country": country,
+                "city": city,
+                "referer": referer,
+                "screen_id": screen_id
+            }).execute()
+    except Exception as e:
+        print(f"Logging error: {e}")
+
+@app.middleware("http")
+async def log_api_requests(request: Request, call_next):
+    """모든 HTTP 요청을 낚아채서 로깅 처리"""
+    
+    # 1. 사용자의 요청을 먼저 정상적으로 처리 (방해하지 않음)
+    response = await call_next(request)
+    
+    path = request.url.path
+    
+    # 2. /api/ 로 시작하는 실제 데이터 요청일 경우에만 로깅 (CORS OPTIONS 요청 제외)
+    if path.startswith("/api/") and request.method != "OPTIONS":
+        # 프록시(Vercel/Render)를 거쳤을 때의 실제 클라이언트 IP 추출
+        forwarded_for = request.headers.get("x-forwarded-for")
+        client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
+        
+        # 접속 경로 (어느 URL에서 이 API를 호출했는지)
+        referer = request.headers.get("referer", "Direct")
+        
+        # 화면 ID 대신 호출한 API의 경로(예: /api/news, /api/search/KS11)를 기록
+        screen_id = path
+        
+        # 3. 사용자 체감 응답 속도를 늦추지 않기 위해 "백그라운드"에서 DB 로깅 실행!
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _sync_log_visit, client_ip, referer, screen_id)
+        
+    return response
+
 
 # ==============================================================================
 # 🌟 스마트 캐시 (Last-Modified 기반)
@@ -119,76 +195,6 @@ def refresh_quant_cache():
         print(f"✅ [퀀트 캐시 예열] {latest_ts}")
     except Exception as e:
         print(f"⚠️ 퀀트 캐시 예열 실패: {e}")
-
-# ==============================================================================
-# 📊 [신규] 사용자 접속 통계 및 로깅 API
-# ==============================================================================
-class VisitLogRequest(BaseModel):
-    screen_id: str
-
-def get_geolocation_from_ip(ip: str):
-    """간단한 외부 API를 이용해 IP의 지역(국가/도시) 정보를 가져옵니다."""
-    try:
-        # ip-api.com은 무료이며 키 없이 초당 45회 조회가 가능합니다.
-        url = f"http://ip-api.com/json/{ip}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if data.get('status') == 'success':
-                return data.get('country', 'Unknown'), data.get('city', 'Unknown')
-    except Exception as e:
-        print(f"IP Geo lookup error: {e}")
-    return "Unknown", "Unknown"
-
-def process_visit_log_background(client_ip: str, referer: str, screen_id: str):
-    """백그라운드에서 지역 정보 조회 및 Supabase Upsert 수행 (API 응답 지연 방지)"""
-    if not supabase: return
-    
-    country, city = get_geolocation_from_ip(client_ip)
-    
-    try:
-        # 먼저 해당 IP와 화면 조합이 있는지 확인
-        res = supabase.table("visitor_logs").select("visit_count").eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
-        
-        if res.data:
-            # 존재하면 조회수(visit_count) + 1 로 업데이트
-            current_count = res.data[0]['visit_count']
-            supabase.table("visitor_logs").update({
-                "visit_count": current_count + 1,
-                "last_visit": "now()",
-                "referer": referer # 리퍼러가 바뀌었을 수 있으므로 업데이트
-            }).eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
-        else:
-            # 없으면 새로 삽입 (초기 visit_count=1은 DB 디폴트로 들어감)
-            supabase.table("visitor_logs").insert({
-                "ip_address": client_ip,
-                "country": country,
-                "city": city,
-                "referer": referer,
-                "screen_id": screen_id
-            }).execute()
-    except Exception as e:
-        print(f"Visitor logging error: {e}")
-
-@app.post("/api/log-visit")
-async def log_visit(request: Request, body: VisitLogRequest, background_tasks: BackgroundTasks):
-    """프론트엔드에서 화면 마운트 시 호출할 엔드포인트"""
-    
-    # 1. 프록시(Vercel 등) 환경에서의 실제 클라이언트 IP 추출
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        client_ip = forwarded_for.split(",")[0].strip()
-    else:
-        client_ip = request.client.host
-        
-    # 2. 유입 경로(Referer) 추출 (없으면 'Direct')
-    referer = request.headers.get("referer", "Direct")
-    screen_id = body.screen_id
-    
-    # API 응답은 즉시 반환하고, 외부 API 호출과 DB 저장은 백그라운드로 넘김
-    background_tasks.add_task(process_visit_log_background, client_ip, referer, screen_id)
-    
-    return {"status": "success", "message": "Log processed"}
 
 
 @app.get("/api/news")
