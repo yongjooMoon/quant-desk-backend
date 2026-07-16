@@ -44,12 +44,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL els
 KST = ZoneInfo("Asia/Seoul")
 
 # ==============================================================================
-# 📊 [신규] 모든 API 호출을 추적하는 로깅 미들웨어 (문지기)
+# 📊 [신규] 모든 API 호출을 추적하는 로깅 미들웨어 (한국시간 & 인앱 감지)
 # ==============================================================================
 def get_geolocation_from_ip(ip: str):
     """간단한 외부 API를 이용해 IP의 지역(국가/도시) 정보를 가져옵니다."""
     try:
-        # 로컬 접속 제외
         if ip in ["127.0.0.1", "localhost", "::1"]:
             return "Local", "Local"
             
@@ -63,20 +62,36 @@ def get_geolocation_from_ip(ip: str):
         pass
     return "Unknown", "Unknown"
 
-def _sync_log_visit(client_ip: str, referer: str, screen_id: str):
+def _sync_log_visit(client_ip: str, referer: str, user_agent: str, screen_id: str):
     """DB에 접속 기록을 저장하거나 업데이트(Upsert)하는 실제 함수"""
     if not supabase: return
     country, city = get_geolocation_from_ip(client_ip)
     try:
-        # 1. IP와 화면ID(API 주소) 조합이 존재하는지 확인
+        # 1. IP와 화면ID 조합 확인
         res = supabase.table("visitor_logs").select("visit_count").eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
         
+        # 🌟 UTC 대신 무조건 한국 시간(KST)으로 저장되도록 강제 주입!
+        kst_time = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 🌟 인앱 브라우저 감지 (Referer가 날아가는 현상 우회 해결)
+        ua_lower = user_agent.lower()
+        if "remember" in ua_lower:
+            referer = "Remember App"
+        elif "kakaotalk" in ua_lower:
+            referer = "KakaoTalk"
+        elif "instagram" in ua_lower:
+            referer = "Instagram"
+        elif "naver" in ua_lower:
+            referer = "Naver App"
+        elif referer == "Direct" or not referer:
+            referer = "Direct or Unknown"
+
         if res.data:
-            # 2. 존재하면 조회수(visit_count) + 1 로 업데이트
+            # 2. 존재하면 조회수 + 1 업데이트 및 한국시간 적용
             current_count = res.data[0]['visit_count']
             supabase.table("visitor_logs").update({
                 "visit_count": current_count + 1,
-                "last_visit": "now()",
+                "last_visit": kst_time,
                 "referer": referer
             }).eq("ip_address", client_ip).eq("screen_id", screen_id).execute()
         else:
@@ -86,7 +101,8 @@ def _sync_log_visit(client_ip: str, referer: str, screen_id: str):
                 "country": country,
                 "city": city,
                 "referer": referer,
-                "screen_id": screen_id
+                "screen_id": screen_id,
+                "last_visit": kst_time
             }).execute()
     except Exception as e:
         print(f"Logging error: {e}")
@@ -94,27 +110,20 @@ def _sync_log_visit(client_ip: str, referer: str, screen_id: str):
 @app.middleware("http")
 async def log_api_requests(request: Request, call_next):
     """모든 HTTP 요청을 낚아채서 로깅 처리"""
-    
-    # 1. 사용자의 요청을 먼저 정상적으로 처리 (방해하지 않음)
     response = await call_next(request)
-    
     path = request.url.path
     
-    # 2. /api/ 로 시작하는 실제 데이터 요청일 경우에만 로깅 (CORS OPTIONS 요청 제외)
     if path.startswith("/api/") and request.method != "OPTIONS":
-        # 프록시(Vercel/Render)를 거쳤을 때의 실제 클라이언트 IP 추출
         forwarded_for = request.headers.get("x-forwarded-for")
         client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
         
-        # 접속 경로 (어느 URL에서 이 API를 호출했는지)
         referer = request.headers.get("referer", "Direct")
-        
-        # 화면 ID 대신 호출한 API의 경로(예: /api/news, /api/search/KS11)를 기록
+        user_agent = request.headers.get("user-agent", "")
         screen_id = path
         
-        # 3. 사용자 체감 응답 속도를 늦추지 않기 위해 "백그라운드"에서 DB 로깅 실행!
+        # 백그라운드에서 DB 로깅 실행
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _sync_log_visit, client_ip, referer, screen_id)
+        loop.run_in_executor(None, _sync_log_visit, client_ip, referer, user_agent, screen_id)
         
     return response
 
@@ -131,10 +140,7 @@ class SmartCache:
 news_smart_cache = SmartCache()
 quant_smart_cache = SmartCache()
 
-# 종목 검색용 KRX 리스트 (24시간)
 krx_cache = TTLCache(maxsize=5, ttl=86400)
-
-# 💡 개별 종목 펀더멘털 데이터 및 지수 캐시 (50초 유지) - 브라우저 폴링(60초) 대비
 funda_cache = TTLCache(maxsize=3000, ttl=50)
 
 def _get_latest_news_ts():
@@ -250,13 +256,12 @@ def get_krx_list(refresh: str = "false"):
 
 
 # ==============================================================================
-# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API (현물 지수 완벽 지원)
+# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API
 # ==============================================================================
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
 
-    # 1. 50초 TTL 스마트 캐싱 (프론트가 1분마다 찔러도 증권사 API/DB 부하 0)
     if symbol in funda_cache:
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
 
@@ -268,12 +273,10 @@ def search_stock(symbol: str, t: Optional[str] = None):
         chart_data = []
         market_status = "장마감"
         
-        # 야후 차단 회피용 강력한 헤더
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
         if is_index:
             if symbol in ['KS11', 'KQ11']:
-                # 🚨 한국 지수: 네이버 실시간 API
                 naver_sym = "KOSPI" if symbol == 'KS11' else "KOSDAQ"
                 try:
                     url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{naver_sym}"
@@ -288,12 +291,10 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except Exception as e:
                     print("Naver API error:", e)
 
-                # 🌟 KOSPI 장마감 시간 철통 방어 (네이버 API가 OPEN으로 버그를 낼 때 대비)
                 now_k = now_kst()
                 if now_k.weekday() >= 5 or now_k.hour < 9 or (now_k.hour == 15 and now_k.minute > 30) or now_k.hour > 15:
                     market_status = "장마감"
 
-                # 차트 데이터용 (과거)
                 try:
                     df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
                     if not df_price.empty:
@@ -304,11 +305,9 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except: pass
 
             else:
-                # 🚨 미국 지수: 야후 현물(Spot)
                 yahoo_ticker_map = {'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
                 y_sym = yahoo_ticker_map.get(symbol, symbol)
                 
-                # 차트 API로 가격/수익률 우선 추출
                 try:
                     chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
                     req = urllib.request.Request(chart_url, headers=headers)
@@ -318,14 +317,12 @@ def search_stock(symbol: str, t: Optional[str] = None):
                         meta = c_data['meta']
                         curr_price = float(meta['regularMarketPrice'])
                         
-                        # 🌟 야후 메타데이터를 활용한 완벽한 '미장 장중/장마감' 판별 (서머타임/휴일 자동 계산됨)
                         try:
                             trading_periods = meta.get('currentTradingPeriod', {}).get('regular', {})
                             start_ts = trading_periods.get('start', 0)
                             end_ts = trading_periods.get('end', 0)
                             now_ts = int(datetime.utcnow().timestamp())
                             
-                            # 현재 UTC 시간이 오늘 정규장 시간 사이에 있는지 확인
                             if start_ts <= now_ts < end_ts:
                                 market_status = "장중"
                             else:
@@ -342,7 +339,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                             df_price = df_price.dropna()
                             
                             if len(df_price) >= 2:
-                                # 🌟 chartPreviousClose 버그 완벽 수정: 배열에 있는 가장 최근 '어제 종가'를 직접 씁니다!
                                 prev_close = float(df_price['Close'].iloc[-2])
                                 ret_1d = ((curr_price - prev_close) / prev_close) * 100
                             
@@ -353,7 +349,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                 except Exception as e:
                     print("Yahoo Chart error:", e)
-                    # 최후의 보루: fdr
                     try:
                         df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
                         if not df_price.empty:
@@ -366,7 +361,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                     except: pass
 
-            # 지수(Index) 결과 포맷팅
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
             result_data = {
                 "symbol": symbol,
@@ -386,7 +380,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
             return {"status": "success", "data": result_data}
 
         else:
-            # 🌟 일반 종목 처리
             df_price = load_price_from_db(supabase, symbol)
             if df_price.empty:
                 try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
