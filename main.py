@@ -241,9 +241,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                         
                         meta = c_data['meta']
                         curr_price = float(meta['regularMarketPrice'])
-                        prev_close = float(meta['chartPreviousClose'])
-                        if prev_close > 0:
-                            ret_1d = ((curr_price - prev_close) / prev_close) * 100
                         
                         # 🌟 야후 메타데이터를 활용한 완벽한 '미장 장중/장마감' 판별 (서머타임/휴일 자동 계산됨)
                         try:
@@ -267,6 +264,12 @@ def search_stock(symbol: str, t: Optional[str] = None):
                         if timestamps and closes:
                             df_price = pd.DataFrame({'Close': closes}, index=pd.to_datetime(timestamps, unit='s', utc=True).tz_convert('Asia/Seoul'))
                             df_price = df_price.dropna()
+                            
+                            if len(df_price) >= 2:
+                                # 🌟 chartPreviousClose 버그 완벽 수정: 배열에 있는 가장 최근 '어제 종가'를 직접 씁니다!
+                                prev_close = float(df_price['Close'].iloc[-2])
+                                ret_1d = ((curr_price - prev_close) / prev_close) * 100
+                            
                             if len(df_price) >= 21:
                                 ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
                             
