@@ -54,6 +54,71 @@ CONFIRM_FILTER_MIN  = 6     # 6개 강력한 추격매수 조건 ALL PASS
 WATCHLIST_FILTER_MIN= 4     # 최소 4개 이상 통과시 관심종목
 
 # ══════════════════════════════════════════
+# [규모 1] 시장 레짐(국면) 파라미터
+# ══════════════════════════════════════════
+# 레짐별 ATR 트레일링 배수 — 강세장은 넉넉히 태우고, 약세장은 바짝 조임
+REGIME_ATR_MULT = {"BULL": 3.0, "NEUTRAL": 2.5, "BEAR": 1.5}
+# 레짐별 초기 손절 상한(%) — 약세장은 최대 손실폭 자체를 줄임
+REGIME_RISK_CAP = {"BULL": 0.15, "NEUTRAL": 0.15, "BEAR": 0.10}
+# 레짐별 워치리스트 진입 문턱 — 약세장엔 더 깐깐하게
+REGIME_WATCHLIST_MIN = {"BULL": WATCHLIST_FILTER_MIN, "NEUTRAL": WATCHLIST_FILTER_MIN, "BEAR": WATCHLIST_FILTER_MIN + 1}
+
+# ══════════════════════════════════════════
+# [순위 2] 이익 보호(Profit Protection) 파라미터 — 고정 40% 익절 폐지
+# ══════════════════════════════════════════
+PROFIT_LOCK_TRIGGER_PCT     = 15.0  # 수익률이 이 값을 넘으면 "이익 보호 모드" 진입
+PROFIT_LOCK_ATR_MULT_FACTOR = 0.6   # 보호 모드에서 트레일링 ATR 배수를 좁히는 비율 (더 타이트하게 추종)
+VOL_COOLING_RATIO           = 0.8   # 최근 5일 거래량이 20일 평균의 이 비율 밑으로 식으면 "모멘텀 소진" 후보
+
+# ══════════════════════════════════════════
+# [순위 3] 추세 붕괴(Trend Breakdown) 조기화 — 3중 AND(만장일치) 완화
+# ══════════════════════════════════════════
+# 추세붕괴 3개 하위신호(가격<20일선 / 10일선<20일선 / 20일선 하락전환) 중
+# 몇 개 이상 충족돼야 "추세붕괴"로 판정할지를 레짐별로 다르게 적용
+# BULL/NEUTRAL: 2/3 (다수결 - 기존 3/3 만장일치보다 빠르지만 하루짜리 노이즈엔 안 흔들림)
+# BEAR: 1/3 (약세장에선 의심 신호 하나만 떠도 즉시 컷)
+REGIME_TREND_BREAK_MIN = {"BULL": 2, "NEUTRAL": 2, "BEAR": 1}
+
+def get_market_regime(lookback_days: int = 300) -> dict:
+    """
+    코스피 지수 기반 시장 레짐(국면) 판정
+    - BULL    : 종가가 120일선 위 + 120일선 자체가 상승 중
+    - BEAR    : 종가가 120일선 아래 + 120일선 자체가 하락 중
+    - NEUTRAL : 그 외 (박스권 / 전환 구간) → 보수적으로 중립 취급
+    """
+    try:
+        end = now_kst()
+        start = end - timedelta(days=lookback_days)
+        kospi = fdr.DataReader("KS11", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if kospi.empty or len(kospi) < 130:
+            return {"regime": "NEUTRAL", "reason": "데이터 부족"}
+
+        close = kospi["Close"]
+        ma120 = close.rolling(120).mean()
+        curr_close = float(close.iloc[-1])
+        curr_ma120 = float(ma120.iloc[-1])
+        prev_ma120 = float(ma120.iloc[-20])  # 약 1개월 전 120일선과 비교해 기울기 판정
+
+        above_ma  = curr_close > curr_ma120
+        ma_rising = curr_ma120 > prev_ma120
+
+        if above_ma and ma_rising:
+            regime = "BULL"
+        elif (not above_ma) and (not ma_rising):
+            regime = "BEAR"
+        else:
+            regime = "NEUTRAL"
+
+        return {
+            "regime": regime,
+            "kospi_close": round(curr_close, 2),
+            "ma120": round(curr_ma120, 2),
+            "ma120_slope_pct": round((curr_ma120 / prev_ma120 - 1) * 100, 2),
+        }
+    except Exception as e:
+        return {"regime": "NEUTRAL", "reason": f"오류: {e}"}
+
+# ══════════════════════════════════════════
 # [A] 유니버스 사전 필터링 & [B] 일봉 DB (유지)
 # ══════════════════════════════════════════
 def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -329,8 +394,10 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict) -> dict:
 # ══════════════════════════════════════════
 # [E] 분리된 스크리닝 엔진 (Survival Filter -> Score Ranking)
 # ══════════════════════════════════════════
-def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print) -> tuple:
+def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, regime: str = "NEUTRAL") -> tuple:
     candidates = []
+    watchlist_min = REGIME_WATCHLIST_MIN.get(regime, WATCHLIST_FILTER_MIN)
+    log_fn(f"  [레짐] 현재 시장 국면: {regime} (워치리스트 문턱: {watchlist_min}/6)")
 
     # ── Phase 1. Strict Survival & Chase Filters ──
     for _, row in universe_df.iterrows():
@@ -354,7 +421,7 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print) -> 
 
         pass_count = sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol])
 
-        if pass_count < WATCHLIST_FILTER_MIN:
+        if pass_count < watchlist_min:
             continue
 
         entry_price = curr_price
@@ -431,7 +498,7 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print) -> 
 
         if c["pass_count"] >= CONFIRM_FILTER_MIN:
             confirmed.append(c)
-        elif c["pass_count"] >= WATCHLIST_FILTER_MIN:
+        elif c["pass_count"] >= watchlist_min:
             watchlist.append(c)
 
     confirmed.sort(key=lambda x: x["factor_score"], reverse=True)
