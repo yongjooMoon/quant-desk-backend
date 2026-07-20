@@ -2,8 +2,9 @@ import os
 import json
 import threading
 import urllib.request
+import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -40,7 +41,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
-cipher_suite = Fernet(ENCRYPTION_KEY.encode())
+if ENCRYPTION_KEY:
+    cipher_suite = Fernet(ENCRYPTION_KEY.encode())
+else:
+    print("⚠️ 경고: ENCRYPTION_KEY 환경 변수가 설정되지 않았습니다.")
+    cipher_suite = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("⚠️ 경고: Supabase 환경 변수가 설정되지 않았습니다.")
@@ -190,15 +195,12 @@ def refresh_quant_cache():
         print(f"⚠️ 퀀트 캐시 예열 실패: {e}")
 
 def decrypt_text(encrypted_text: str) -> str:
-    if not encrypted_text:
-        return ""
+    if not encrypted_text or not cipher_suite:
+        return encrypted_text
     try:
-        # 암호문(gAAAAA...)을 받아 복호화하여 평문 API 키로 리턴합니다.
         return cipher_suite.decrypt(encrypted_text.encode('utf-8')).decode('utf-8')
     except Exception:
-        # 이미 평문이거나 복호화에 실패하면 원래 값을 유지합니다.
         return encrypted_text
-
 
 @app.get("/api/news")
 def get_news(limit: int = 500, refresh: str = "false"):
@@ -443,7 +445,7 @@ def search_stock(symbol: str, t: Optional[str] = None):
         return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복)
+# 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
 # ==============================================================================
 @app.get("/api/realestate/build-stream")
 async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_date: str, end_date: str, filters: str = ""):
@@ -463,10 +465,21 @@ async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_d
 
             gen = generate_excel_data(rtms_key, gu_code, gu_name, dong, s_date, e_date, apt_filters)
             
+            # 🌟 Render의 100초 타임아웃 방어를 위한 Ping(더미 메시지)용 시간 추적
+            last_yield_time = datetime.now()
+
             for status, payload in gen:
+                # 🌟 현재 시간과 마지막으로 보낸 시간을 비교하여, 15초 이상 지연되면 무조건 ping 로그를 보냄
+                current_time = datetime.now()
+                if (current_time - last_yield_time).total_seconds() > 15:
+                    yield f"data: {json.dumps({'status': 'progress', 'message': '...연결 유지용 Ping 전송 및 K-APT 데이터 크롤링 대기 중...'})}\n\n"
+                    await asyncio.sleep(0.01)
+                    last_yield_time = datetime.now()
+
                 if status == "progress" or status == "log":
                     yield f"data: {json.dumps({'status': 'log', 'message': payload})}\n\n"
-                    await asyncio.sleep(0.1)
+                    last_yield_time = datetime.now()
+                    await asyncio.sleep(0.1) # 버퍼링 방지용 약간의 지연 (필수)
                 elif status == "error":
                     yield f"data: {json.dumps({'status': 'error', 'message': payload})}\n\n"
                     return
@@ -480,6 +493,21 @@ async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_d
             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.get("/api/realestate/download")
+def download_realestate():
+    excel_data = getattr(app.state, "last_excel_data", None)
+    filename = getattr(app.state, "last_excel_filename", "부동산_실거래가.xlsx")
+    
+    if not excel_data:
+        return {"status": "error", "message": "다운로드할 데이터가 없습니다."}
+        
+    encoded_filename = urllib.parse.quote(filename)
+    return Response(
+        content=excel_data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
 
 scheduler = BackgroundScheduler(timezone=KST)
 BATCH_WARMUP_TIMES = [(8, 10), (14, 40), (16, 40), (23, 40)]
