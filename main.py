@@ -2,7 +2,9 @@ import os
 import json
 import threading
 import urllib.request
+import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -17,8 +19,8 @@ from cachetools import TTLCache, cached
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
 
-# 기존 quant_core 및 real_estate 모듈 활용
-from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
+# 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text가 추가되었습니다)
+from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db, decrypt_text
 from real_estate import generate_excel_data
 
 load_dotenv()
@@ -44,7 +46,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL els
 KST = ZoneInfo("Asia/Seoul")
 
 # ==============================================================================
-# 📊 [신규] 프론트엔드에서 쏴주는 데이터를 받는 로깅 전용 API
+# 📊 프론트엔드에서 쏴주는 데이터를 받는 로깅 전용 API
 # ==============================================================================
 class VisitLogRequest(BaseModel):
     referer: str
@@ -52,7 +54,6 @@ class VisitLogRequest(BaseModel):
     screen_id: str
 
 def get_geolocation_from_ip(ip: str):
-    """간단한 외부 API를 이용해 IP의 지역(국가/도시) 정보를 가져옵니다."""
     try:
         if ip in ["127.0.0.1", "localhost", "::1"]:
             return "Local", "Local"
@@ -68,30 +69,20 @@ def get_geolocation_from_ip(ip: str):
     return "Unknown", "Unknown"
 
 def _process_log_visit(client_ip: str, payload: VisitLogRequest):
-    """백그라운드에서 DB에 저장/업데이트 수행"""
     if not supabase: return
     country, city = get_geolocation_from_ip(client_ip)
     
     try:
-        # 1. KST(한국시간) 강제 계산
         kst_time = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 2. User-Agent를 까서 인앱 브라우저를 강제로 잡아냄 (프론트에서 넘겨준 Referer가 빈약할 때 대비)
         ua_lower = payload.user_agent.lower()
         final_referer = payload.referer
         
-        if "remember" in ua_lower:
-            final_referer = "Remember App"
-        elif "kakaotalk" in ua_lower:
-            final_referer = "KakaoTalk"
-        elif "instagram" in ua_lower:
-            final_referer = "Instagram"
-        elif "naver" in ua_lower:
-            final_referer = "Naver App"
-        elif not final_referer or final_referer == "Direct":
-            final_referer = "Direct / Unknown"
+        if "remember" in ua_lower: final_referer = "Remember App"
+        elif "kakaotalk" in ua_lower: final_referer = "KakaoTalk"
+        elif "instagram" in ua_lower: final_referer = "Instagram"
+        elif "naver" in ua_lower: final_referer = "Naver App"
+        elif not final_referer or final_referer == "Direct": final_referer = "Direct / Unknown"
 
-        # 3. IP 확인 후 Upsert 로직
         res = supabase.table("visitor_logs").select("visit_count").eq("ip_address", client_ip).eq("screen_id", payload.screen_id).execute()
         
         if res.data:
@@ -115,17 +106,13 @@ def _process_log_visit(client_ip: str, payload: VisitLogRequest):
 
 @app.post("/api/log-visit")
 async def log_visit(request: Request, body: VisitLogRequest, background_tasks: BackgroundTasks):
-    """프론트엔드 접속 시 최초 1회만 호출되는 API"""
-    # Vercel/Render 프록시 환경의 실제 Client IP 추출
     forwarded_for = request.headers.get("x-forwarded-for")
     client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
-    
-    # 지연 없이 바로 200 반환, 저장은 백그라운드 태스크로
     background_tasks.add_task(_process_log_visit, client_ip, body)
     return {"status": "success"}
 
 # ==============================================================================
-# 🌟 스마트 캐시 (Last-Modified 기반)
+# 🌟 스마트 캐시
 # ==============================================================================
 class SmartCache:
     def __init__(self):
@@ -252,13 +239,12 @@ def get_krx_list(refresh: str = "false"):
 
 
 # ==============================================================================
-# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API (현물 지수 완벽 지원)
+# ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API 
 # ==============================================================================
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
 
-    # 1. 50초 TTL 스마트 캐싱
     if symbol in funda_cache:
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
 
@@ -274,7 +260,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
 
         if is_index:
             if symbol in ['KS11', 'KQ11']:
-                # 🚨 한국 지수: 네이버 실시간 API
                 naver_sym = "KOSPI" if symbol == 'KS11' else "KOSDAQ"
                 try:
                     url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{naver_sym}"
@@ -289,12 +274,10 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except Exception as e:
                     print("Naver API error:", e)
 
-                # 🌟 KOSPI 장마감 시간 철통 방어 (네이버 API 버그 대비)
                 now_k = now_kst()
                 if now_k.weekday() >= 5 or now_k.hour < 9 or (now_k.hour == 15 and now_k.minute > 30) or now_k.hour > 15:
                     market_status = "장마감"
 
-                # 차트 데이터용 (과거)
                 try:
                     df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
                     if not df_price.empty:
@@ -305,11 +288,9 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 except: pass
 
             else:
-                # 🚨 미국 지수: 야후 현물(Spot)
                 yahoo_ticker_map = {'US500': '^GSPC', 'IXIC': '^IXIC', 'DJI': '^DJI'}
                 y_sym = yahoo_ticker_map.get(symbol, symbol)
                 
-                # 차트 API로 가격/수익률 우선 추출
                 try:
                     chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1d&range=150d"
                     req = urllib.request.Request(chart_url, headers=headers)
@@ -319,7 +300,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                         meta = c_data['meta']
                         curr_price = float(meta['regularMarketPrice'])
                         
-                        # 🌟 야후 메타데이터를 활용한 완벽한 '미장 장중/장마감' 판별 (서머타임 자동 계산)
                         try:
                             trading_periods = meta.get('currentTradingPeriod', {}).get('regular', {})
                             start_ts = trading_periods.get('start', 0)
@@ -352,7 +332,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                 except Exception as e:
                     print("Yahoo Chart error:", e)
-                    # 최후의 보루: fdr
                     try:
                         df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=150)).strftime('%Y-%m-%d'))
                         if not df_price.empty:
@@ -365,7 +344,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
                                 chart_data.append({"date": idx.strftime("%Y-%m-%d"), "price": float(row['Close'])})
                     except: pass
 
-            # 지수(Index) 결과 포맷팅
             index_names = {'KS11': '코스피', 'KQ11': '코스닥', 'US500': 'S&P 500', 'IXIC': 'NASDAQ'}
             result_data = {
                 "symbol": symbol,
@@ -385,7 +363,6 @@ def search_stock(symbol: str, t: Optional[str] = None):
             return {"status": "success", "data": result_data}
 
         else:
-            # 🌟 일반 종목 처리
             df_price = load_price_from_db(supabase, symbol)
             if df_price.empty:
                 try: df_price = fdr.DataReader(symbol, (now_kst() - timedelta(days=300)).strftime('%Y-%m-%d'))
@@ -452,42 +429,65 @@ def search_stock(symbol: str, t: Optional[str] = None):
         return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# 🏢 5. 부동산 아파트 실거래가 스캔 API
+# 🏢 5. 부동산 아파트 실거래가 스캔 API (수정됨)
 # ==============================================================================
-class RealEstateRequest(BaseModel):
-    api_key: str
-    district_code: str
-    district_name: str
-    target_dong: str
-    start_date: str
-    end_date: str
-    apt_filters: str
 
-from fastapi.responses import StreamingResponse
-
-@app.post("/api/real-estate")
-async def scan_real_estate(req: RealEstateRequest):
+@app.get("/api/realestate/build-stream")
+async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_date: str, end_date: str, filters: str = ""):
     async def event_generator():
         try:
-            sd = datetime.strptime(req.start_date, "%Y-%m-%d")
-            ed = datetime.strptime(req.end_date, "%Y-%m-%d")
-            filters = [f.strip() for f in req.apt_filters.split(',')] if req.apt_filters else []
-            gen = generate_excel_data(req.api_key, req.district_code, req.district_name, req.target_dong, sd, ed, filters)
-            for event_type, data in gen:
-                if event_type == "success":
-                    import base64
-                    b64_data = base64.b64encode(data["data"]).decode('utf-8')
-                    yield f"data: {json.dumps({'status': 'success', 'file_data': b64_data, 'filename': data['filename']})}\n\n"
-                    break
-                elif event_type == "error":
-                    yield f"data: {json.dumps({'status': 'error', 'message': data})}\n\n"
-                    break
-                else:
-                    yield f"data: {json.dumps({'status': event_type, 'message': data})}\n\n"
-                await asyncio.sleep(0.01)
+            # 1. DB에서 관리자 API 키 로드
+            res = supabase.table("user_api_keys").select("rtms_key").eq("username", "admin").execute()
+            if not res.data or not res.data[0].get("rtms_key"):
+                yield f"data: {json.dumps({'status': 'error', 'message': '서버에 API 키가 설정되지 않았습니다.'})}\n\n"
+                return
+
+            # 2. DB에서 꺼내온 암호화 상태의 rtms_key를 대칭키 복호화 처리하여 원본 키를 추출
+            encrypted_key = res.data[0]["rtms_key"]
+            rtms_key = decrypt_text(encrypted_key)
+
+            # 3. 매개변수 파싱
+            s_date = datetime.strptime(start_date, "%Y-%m-%d")
+            e_date = datetime.strptime(end_date, "%Y-%m-%d")
+            apt_filters = [f.strip() for f in filters.split(',')] if filters.strip() else []
+
+            # 4. 제네레이터를 순회하며 상태와 로그를 프론트엔드로 실시간 스트리밍
+            for status, payload in generate_excel_data(rtms_key, gu_code, gu_name, dong, s_date, e_date, apt_filters):
+                if status == "progress" or status == "log":
+                    # 로그 전송
+                    yield f"data: {json.dumps({'status': 'log', 'message': payload})}\n\n"
+                    await asyncio.sleep(0.1)  # 버퍼링 방지용 약간의 지연
+                elif status == "error":
+                    yield f"data: {json.dumps({'status': 'error', 'message': payload})}\n\n"
+                    return
+                elif status == "success":
+                    # 🌟 엑셀 바이너리 데이터 임시 저장
+                    app.state.last_excel_data = payload["data"]
+                    app.state.last_excel_filename = payload["filename"]
+                    yield f"data: {json.dumps({'status': 'done', 'message': '엑셀 생성 완료!'})}\n\n"
+                    return
+
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/api/realestate/download")
+def download_realestate():
+    """서버(app.state)에 임시 저장된 마지막 엑셀 파일을 다운로드합니다."""
+    excel_data = getattr(app.state, "last_excel_data", None)
+    filename = getattr(app.state, "last_excel_filename", "부동산_실거래가.xlsx")
+    
+    if not excel_data:
+        return {"status": "error", "message": "다운로드할 데이터가 없습니다."}
+        
+    encoded_filename = urllib.parse.quote(filename)
+    return Response(
+        content=excel_data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
 
 
 scheduler = BackgroundScheduler(timezone=KST)
