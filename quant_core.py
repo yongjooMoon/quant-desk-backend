@@ -44,7 +44,7 @@ TBL_FUNDA   = "stock_fundamental"
 TBL_SCREEN  = "quant_screening_cache"
 TBL_WATCH   = "quant_watchlist_cache"
 
-ROLLING_DAYS   = 756
+ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일봉부터 삭제)
 FUNDA_TTL_SEC  = 86400 * 90
 PREFILTER_MARCAP_억 = 1500
 PREFILTER_TVOL_억   = 50
@@ -216,6 +216,100 @@ def trim_old_rows(supabase, symbol: str):
         dates = [r["date"] for r in res.data]
         if len(dates) > ROLLING_DAYS: supabase.table(TBL_DAILY).delete().eq("symbol", symbol).lte("date", dates[len(dates) - ROLLING_DAYS - 1]).execute()
     except: pass
+
+# ══════════════════════════════════════════
+# [B-1] 일봉 공백(Gap) 탐지 & 자동 채움 (init)
+# ══════════════════════════════════════════
+def get_trading_calendar(lookback_days: int = ROLLING_DAYS) -> list:
+    """
+    실제 개장일 목록(코스피 지수 기준)을 하나만 받아서 모든 종목의 결측일 판정 기준으로 재사용.
+    배치 1회 실행당 딱 1번만 호출하면 됨 (종목마다 부르지 않음).
+    """
+    try:
+        end = now_kst()
+        start = end - timedelta(days=lookback_days + 10)
+        idx = fdr.DataReader("KS11", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if idx.empty: return []
+        return [d.strftime("%Y-%m-%d") for d in idx.index]
+    except Exception:
+        return []
+
+def find_price_gaps(supabase, symbol: str, trading_calendar: list) -> list:
+    """DB에 이미 있는 날짜와 실제 개장일 캘린더를 비교해서 비어있는 날짜 목록을 반환"""
+    if not trading_calendar: return []
+    try:
+        res = supabase.table(TBL_DAILY).select("date").eq("symbol", symbol).execute()
+        existing = {r["date"] for r in res.data}
+    except Exception:
+        return []
+    today_str = now_kst().strftime("%Y-%m-%d")
+    # 오늘자는 배치 STEP2(당일 시세 수집)에서 별도로 채우므로 캘린더에서 제외하고 비교
+    return sorted(d for d in trading_calendar if d != today_str and d not in existing)
+
+def _default_history_fetcher(symbol: str, start_date: str, end_date: str) -> list:
+    """
+    기본 폴백 fetcher (FDR 크롤링). history_fetcher를 안 넘기면 이걸 씀.
+    ⚠️ 크롤링 기반이라 응답이 느리거나 막힐 수 있음 — 배치(cron)에서는 KIS API 기반 fetcher를 넘겨서 씀.
+    """
+    try:
+        df = fdr.DataReader(symbol, start_date, end_date)
+        if df.empty: return []
+        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        return [
+            {"date": dt.strftime("%Y-%m-%d"), "open": r.get("open"), "high": r.get("high"),
+             "low": r.get("low"), "close": r.get("close"), "volume": r.get("volume")}
+            for dt, r in df.iterrows()
+        ]
+    except Exception:
+        return []
+
+def fill_price_gaps(supabase, symbol: str, name: str, trading_calendar: list, history_fetcher=None) -> int:
+    """
+    [init] 결측 구간이 있으면 다시 받아서 stock_daily 공백을 메운다.
+    (예: 특정 기간 시세 수집이 누락된 경우 자동 복구용)
+
+    history_fetcher(symbol, start_date, end_date) -> list[{"date","open","high","low","close","volume"}]
+      배치(cron)에서는 이미 인증된 KIS API 기반 fetcher를 넘겨서 씀.
+      크롤링(FDR) 기반은 응답이 멈추거나 차단될 수 있어 배치에서는 권장하지 않음 → 안 넘기면 폴백으로만 사용.
+
+    반환값: 실제로 채운 행 수. 개별 종목에서 실패해도 예외를 삼키고 0을 반환해 배치 전체가 멈추지 않게 한다.
+    """
+    missing_dates = find_price_gaps(supabase, symbol, trading_calendar)
+    if not missing_dates:
+        return 0
+
+    fetcher = history_fetcher or _default_history_fetcher
+    try:
+        raw_rows = fetcher(symbol, missing_dates[0], missing_dates[-1])
+    except Exception:
+        return 0
+    if not raw_rows:
+        return 0
+
+    missing_set = set(missing_dates)
+    rows = []
+    for r in raw_rows:
+        d_str = r.get("date")
+        if not d_str or d_str not in missing_set:
+            continue
+        close_v = r.get("close")
+        if close_v is None or (isinstance(close_v, float) and pd.isna(close_v)) or close_v == 0:
+            continue
+        try:
+            rows.append({
+                "date": d_str,
+                "open": int(r.get("open") or 0),
+                "high": int(r.get("high") or 0),
+                "low": int(r.get("low") or 0),
+                "close": int(close_v),
+                "volume": int(r.get("volume") or 0),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    if rows:
+        upsert_daily_rows(supabase, symbol, name, rows)
+    return len(rows)
 
 # ══════════════════════════════════════════
 # [C] 펀더멘털 스크래핑 (업그레이드 적용)
@@ -601,3 +695,22 @@ def load_screening_result(supabase) -> tuple:
         if r2.data: w = json.loads(r2.data[0]["results"])
     except: pass
     return c, w, ts
+
+# ══════════════════════════════════════════
+# [F] 백테스트 결과 캐시 (id=14) — 프론트 차트용
+# ══════════════════════════════════════════
+TBL_BACKTEST_CACHE_ID = 14
+
+def save_backtest_result(supabase, result: dict):
+    ts = now_kst_str()
+    supabase.table(TBL_SCREEN).upsert([
+        {"id": TBL_BACKTEST_CACHE_ID, "results": json.dumps(result, ensure_ascii=False, cls=NumpyEncoder), "updated_at": ts}
+    ]).execute()
+
+def load_backtest_result(supabase) -> dict:
+    try:
+        r = supabase.table(TBL_SCREEN).select("*").eq("id", TBL_BACKTEST_CACHE_ID).execute()
+        if r.data:
+            return json.loads(r.data[0]["results"])
+    except: pass
+    return {}
