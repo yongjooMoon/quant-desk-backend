@@ -79,6 +79,28 @@ VOL_COOLING_RATIO           = 0.8   # 최근 5일 거래량이 20일 평균의 �
 # BEAR: 1/3 (약세장에선 의심 신호 하나만 떠도 즉시 컷)
 REGIME_TREND_BREAK_MIN = {"BULL": 2, "NEUTRAL": 2, "BEAR": 1}
 
+# ══════════════════════════════════════════
+# [순위 4] 진입(Entry) 개선 — 지속성 / 과열 캡 / 상대강도(RS)
+# ══════════════════════════════════════════
+# 과열 캡: 고정 %가 아니라 dynamic_mdd_limit과 같은 방식으로 ATR% 기반 동적 계산
+#   허용 이격 = ATR% × OVEREXTENSION_ATR_MULT, 단 [FLOOR, CEIL] 사이로 클리핑
+#   → 변동성 큰 코스닥 소형 성장주는 넉넉하게, 변동성 낮은 대형주는 빡빡하게 자동 적용
+OVEREXTENSION_ATR_MULT  = 4.0
+OVEREXTENSION_FLOOR_PCT = 15.0
+OVEREXTENSION_CEIL_PCT  = 50.0
+
+# 수급 게이트 지속성: 당일 서지 배수를 1.2배(약함) → 1.5배로 상향, 5일 평균 조건과 밸런스 맞춤
+VOL_TODAY_SURGE_MULT    = 1.5
+
+# 돌파 게이트 이중 경로:
+#   ① 표준 경로: 오늘+어제 이틀 연속 90% 돌파권 (지속성 확인, 진입가는 하루 늦음)
+#   ② 강한 신호 예외: 오늘 거래량이 60일 평균의 이 배수를 넘으면, 1일차라도 즉시 통과
+#      → "진짜 강한 돌파는 1일차에 거래량이 터진다"는 지적을 반영해 최고 진입가를 살려둠
+STRONG_BREAKOUT_VOL_MULT = 2.0
+
+# RS(상대강도) — 시장별 벤치마크 분리 (KOSPI 종목→KS11, KOSDAQ 종목→KQ11)
+RS_LOOKBACK_DAYS       = 60
+
 def get_market_regime(lookback_days: int = 300) -> dict:
     """
     코스피 지수 기반 시장 레짐(국면) 판정
@@ -117,6 +139,22 @@ def get_market_regime(lookback_days: int = 300) -> dict:
         }
     except Exception as e:
         return {"regime": "NEUTRAL", "reason": f"오류: {e}"}
+
+def get_index_return_pct(index_code: str = "KS11", period_days: int = RS_LOOKBACK_DAYS, lookback_days: int = 120) -> float:
+    """
+    지수(코스피 KS11 / 코스닥 KQ11)의 최근 N일 수익률(%) — 종목별 상대강도(RS) 계산용 벤치마크 값
+    [순위4 개정] 벤치마크를 KOSPI 하나로 통일하지 않고 종목 시장에 맞는 지수를 쓸 수 있도록 일반화
+    """
+    try:
+        end = now_kst()
+        start = end - timedelta(days=lookback_days)
+        idx = fdr.DataReader(index_code, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if idx.empty or len(idx) < period_days + 1:
+            return 0.0
+        close = idx["Close"]
+        return float((close.iloc[-1] / close.iloc[-(period_days + 1)] - 1) * 100)
+    except Exception:
+        return 0.0
 
 # ══════════════════════════════════════════
 # [A] 유니버스 사전 필터링 & [B] 일봉 DB (유지)
@@ -344,7 +382,7 @@ def get_fundamental(supabase, symbol: str, name: str, dart_api_key: str = "", da
 # ══════════════════════════════════════════
 # [D] 퀀트 지표 (Strict Chase Momentum)
 # ══════════════════════════════════════════
-def calc_quant_metrics(df: pd.DataFrame, fund: dict) -> dict:
+def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0) -> dict:
     """엄격한 돌파/추격매수(Chase Momentum) 지표 산출"""
     metrics = {}
     close = df["Close"]
@@ -361,7 +399,7 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict) -> dict:
     metrics["growth_composite"] = (metrics["net_yoy"] * 0.5) + (op_yoy * 0.3) + (rev_yoy * 0.2)
 
     if len(df) < 60:
-        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","supply_demand"]}
+        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","supply_demand","rs_60d","dynamic_overext_limit_pct"]}
 
     # 2. Dynamic MDD (ATR 기반 생존 방어선)
     roll_max = close.tail(60).cummax()
@@ -379,6 +417,12 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict) -> dict:
     metrics["ma20"] = close.iloc[-20:].mean()
     metrics["ma60"] = close.iloc[-60:].mean()
 
+    # [순위4] 과열(Overextension) 캡을 dynamic_mdd_limit과 같은 방식으로 ATR% 기반 동적 산출
+    # 변동성 큰 종목(코스닥 소형 성장주 등)은 20일선 이격 허용폭이 자동으로 넓어지고,
+    # 변동성 낮은 대형주는 자동으로 빡빡해짐 (고정 %로 두면 생기는 왜곡을 제거)
+    atr_pct = (atr20 / close.iloc[-1]) * 100
+    metrics["dynamic_overext_limit_pct"] = max(OVEREXTENSION_FLOOR_PCT, min(OVEREXTENSION_CEIL_PCT, atr_pct * OVEREXTENSION_ATR_MULT))
+
     # 5. Price Breakout (60일 신고가 근접성)
     metrics["high_60d"] = close.iloc[-60:].max()
 
@@ -389,15 +433,24 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict) -> dict:
     # 7. Supply / Demand
     metrics["supply_demand"] = (fund.get("foreign_net_buy") or 0) + (fund.get("institute_net_buy") or 0)
 
+    # 8. Relative Strength (RS) — 시장별 벤치마크(KOSPI/KOSDAQ 분리) 대비 60일 수익률 격차. 랭킹 전용 팩터
+    if len(close) >= RS_LOOKBACK_DAYS + 1:
+        stock_ret = (close.iloc[-1] / close.iloc[-(RS_LOOKBACK_DAYS + 1)] - 1) * 100
+        metrics["rs_60d"] = stock_ret - benchmark_ret_60d
+    else:
+        metrics["rs_60d"] = 0.0
+
     return metrics
 
 # ══════════════════════════════════════════
 # [E] 분리된 스크리닝 엔진 (Survival Filter -> Score Ranking)
 # ══════════════════════════════════════════
-def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, regime: str = "NEUTRAL") -> tuple:
+def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, regime: str = "NEUTRAL",
+                           kospi_ret_60d: float = 0.0, kosdaq_ret_60d: float = 0.0) -> tuple:
     candidates = []
     watchlist_min = REGIME_WATCHLIST_MIN.get(regime, WATCHLIST_FILTER_MIN)
-    log_fn(f"  [레짐] 현재 시장 국면: {regime} (워치리스트 문턱: {watchlist_min}/6)")
+    log_fn(f"  [레짐] 현재 시장 국면: {regime} (워치리스트 문턱: {watchlist_min}/6) | "
+           f"RS 벤치마크 {RS_LOOKBACK_DAYS}일: KOSPI {kospi_ret_60d:+.2f}% / KOSDAQ {kosdaq_ret_60d:+.2f}%")
 
     # ── Phase 1. Strict Survival & Chase Filters ──
     for _, row in universe_df.iterrows():
@@ -405,19 +458,34 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
         df = load_price_from_db(supabase, symbol)
         if df.empty or len(df) < 60: continue
 
+        # [순위4] RS 벤치마크를 시장별로 분리 (코스닥 종목을 코스피와 비교하는 왜곡 제거)
+        benchmark_ret = kosdaq_ret_60d if str(row.get("Market", "")).upper().startswith("KOSDAQ") else kospi_ret_60d
+
         fund = load_fundamental_from_db(supabase, symbol) or {}
-        metrics = calc_quant_metrics(df, fund)
+        metrics = calc_quant_metrics(df, fund, benchmark_ret_60d=benchmark_ret)
         if "ma20" not in metrics or metrics["ma20"] == 0: continue
 
         curr_price = int(df["Close"].iloc[-1])
+        prev_price = int(df["Close"].iloc[-2]) if len(df) >= 2 else curr_price
+        today_vol  = df["Volume"].iloc[-1]
+        breakout_threshold = metrics["high_60d"] * 0.90
 
         # 절대 조건 6가지 (강력한 추격매수 로직)
+        # [순위4] f_trend: 과열 캡을 ATR% 기반 동적 이격도로 적용 (dynamic_overext_limit_pct)
         f_growth = metrics["growth_composite"] > 0
         f_mdd    = metrics["mdd"] >= metrics["dynamic_mdd_limit"]
         f_liq    = metrics["liquidity_20d"] >= 50
-        f_trend  = (curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"])
-        f_break  = curr_price >= (metrics["high_60d"] * 0.90)
-        f_vol    = metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)
+        f_trend  = (curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
+                   and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100))
+
+        # [순위4] f_break: 이중 경로 — ①표준(2일 연속 돌파권) ②예외(1일차라도 거래량 폭발이면 즉시 인정)
+        # "진짜 강한 돌파는 1일차에 거래량이 터진다"는 점을 반영해 최고 진입가를 살려둔다.
+        f_break_confirmed = (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold)
+        f_break_strong_day1 = (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT))
+        f_break = f_break_confirmed or f_break_strong_day1
+
+        # [순위4] f_vol: 당일 서지 배수 1.2배(약함) → 1.5배로 상향, 5일평균 조건과 밸런스
+        f_vol = (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT))
 
         pass_count = sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol])
 
@@ -463,13 +531,14 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
             "net_income_cur": fund.get("net_income_cur"),
             "revenue_yoy": rev_yoy,
             "net_income_yoy": net_yoy,
+            "rs_60d": round(metrics.get("rs_60d", 0.0), 2),
             "filter_details": {
                 "Growth Composite": {"pass": f_growth, "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
                 "Dynamic MDD": {"pass": f_mdd, "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
                 "Liquidity": {"pass": f_liq, "reason": f"{metrics['liquidity_20d']:.0f}억"},
-                "Trend Alignment": {"pass": f_trend, "reason": f"Price > 20MA > 60MA"},
-                "Price Breakout": {"pass": f_break, "reason": f"고점대비 {(curr_price/metrics['high_60d'])*100:.1f}%"},
-                "Volume Surge": {"pass": f_vol, "reason": f"Vol {(metrics['vol_5d']/metrics['vol_60d']):.1f}x 급증"}
+                "Trend Alignment": {"pass": f_trend, "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
+                "Price Breakout": {"pass": f_break, "reason": ("1일차 강한돌파(Vol≥60d×{:.1f})".format(STRONG_BREAKOUT_VOL_MULT) if f_break_strong_day1 else f"고점대비 {(curr_price/metrics['high_60d'])*100:.1f}% (2일 연속 돌파권)")},
+                "Volume Surge": {"pass": f_vol, "reason": f"Vol {(metrics['vol_5d']/metrics['vol_60d']):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"}
             }
         })
 
@@ -480,12 +549,14 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
     c_df = pd.DataFrame([c["metrics"] for c in candidates])
 
     # 상대평가 랭킹으로 단일 팩터 스코어 생성
-    s_growth = c_df["growth_composite"].rank(pct=True, na_option='bottom') * 20
-    s_break  = (c_df["high_60d"] / c_df["ma20"]).rank(pct=True, ascending=False, na_option='bottom') * 30
-    s_vol    = (c_df["vol_5d"] / c_df["vol_60d"]).rank(pct=True, na_option='bottom') * 30
-    s_sd     = c_df["supply_demand"].rank(pct=True, na_option='bottom') * 20
+    # [순위4] RS(상대강도) 팩터 추가 — 가중치 재배분(20/30/30/20 → 15/25/25/15/20, 합계 100 유지)
+    s_growth = c_df["growth_composite"].rank(pct=True, na_option='bottom') * 15
+    s_break  = (c_df["high_60d"] / c_df["ma20"]).rank(pct=True, ascending=False, na_option='bottom') * 25
+    s_vol    = (c_df["vol_5d"] / c_df["vol_60d"]).rank(pct=True, na_option='bottom') * 25
+    s_sd     = c_df["supply_demand"].rank(pct=True, na_option='bottom') * 15
+    s_rs     = c_df["rs_60d"].rank(pct=True, na_option='bottom') * 20
 
-    factor_score = s_growth + s_break + s_vol + s_sd
+    factor_score = s_growth + s_break + s_vol + s_sd + s_rs
 
     confirmed, watchlist = [], []
     for i, c in enumerate(candidates):
