@@ -18,6 +18,8 @@ from cachetools import TTLCache, cached
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
 
+from cryptography.fernet import Fernet
+
 # 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
 from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
 from real_estate import generate_excel_data
