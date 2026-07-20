@@ -2,9 +2,8 @@ import os
 import json
 import threading
 import urllib.request
-import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -19,8 +18,8 @@ from cachetools import TTLCache, cached
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
 
-# 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text가 추가되었습니다)
-from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db, decrypt_text
+# 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
+from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
 from real_estate import generate_excel_data
 
 load_dotenv()
@@ -37,6 +36,9 @@ app.add_middleware(
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
+cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("⚠️ 경고: Supabase 환경 변수가 설정되지 않았습니다.")
@@ -184,6 +186,16 @@ def refresh_quant_cache():
         print(f"✅ [퀀트 캐시 예열] {latest_ts}")
     except Exception as e:
         print(f"⚠️ 퀀트 캐시 예열 실패: {e}")
+
+def decrypt_text(encrypted_text: str) -> str:
+    if not encrypted_text:
+        return ""
+    try:
+        # 암호문(gAAAAA...)을 받아 복호화하여 평문 API 키로 리턴합니다.
+        return cipher_suite.decrypt(encrypted_text.encode('utf-8')).decode('utf-8')
+    except Exception:
+        # 이미 평문이거나 복호화에 실패하면 원래 값을 유지합니다.
+        return encrypted_text
 
 
 @app.get("/api/news")
@@ -429,39 +441,34 @@ def search_stock(symbol: str, t: Optional[str] = None):
         return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# 🏢 5. 부동산 아파트 실거래가 스캔 API (수정됨)
+# 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복)
 # ==============================================================================
-
 @app.get("/api/realestate/build-stream")
 async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_date: str, end_date: str, filters: str = ""):
     async def event_generator():
         try:
-            # 1. DB에서 관리자 API 키 로드
             res = supabase.table("user_api_keys").select("rtms_key").eq("username", "admin").execute()
             if not res.data or not res.data[0].get("rtms_key"):
-                yield f"data: {json.dumps({'status': 'error', 'message': '서버에 API 키가 설정되지 않았습니다.'})}\n\n"
+                yield f"data: {json.dumps({'status': 'error', 'message': 'API 키가 설정되지 않았습니다.'})}\n\n"
                 return
 
-            # 2. DB에서 꺼내온 암호화 상태의 rtms_key를 대칭키 복호화 처리하여 원본 키를 추출
             encrypted_key = res.data[0]["rtms_key"]
             rtms_key = decrypt_text(encrypted_key)
 
-            # 3. 매개변수 파싱
             s_date = datetime.strptime(start_date, "%Y-%m-%d")
             e_date = datetime.strptime(end_date, "%Y-%m-%d")
             apt_filters = [f.strip() for f in filters.split(',')] if filters.strip() else []
 
-            # 4. 제네레이터를 순회하며 상태와 로그를 프론트엔드로 실시간 스트리밍
-            for status, payload in generate_excel_data(rtms_key, gu_code, gu_name, dong, s_date, e_date, apt_filters):
+            gen = generate_excel_data(rtms_key, gu_code, gu_name, dong, s_date, e_date, apt_filters)
+            
+            for status, payload in gen:
                 if status == "progress" or status == "log":
-                    # 로그 전송
                     yield f"data: {json.dumps({'status': 'log', 'message': payload})}\n\n"
-                    await asyncio.sleep(0.1)  # 버퍼링 방지용 약간의 지연
+                    await asyncio.sleep(0.1)
                 elif status == "error":
                     yield f"data: {json.dumps({'status': 'error', 'message': payload})}\n\n"
                     return
                 elif status == "success":
-                    # 🌟 엑셀 바이너리 데이터 임시 저장
                     app.state.last_excel_data = payload["data"]
                     app.state.last_excel_filename = payload["filename"]
                     yield f"data: {json.dumps({'status': 'done', 'message': '엑셀 생성 완료!'})}\n\n"
@@ -471,24 +478,6 @@ async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_d
             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.get("/api/realestate/download")
-def download_realestate():
-    """서버(app.state)에 임시 저장된 마지막 엑셀 파일을 다운로드합니다."""
-    excel_data = getattr(app.state, "last_excel_data", None)
-    filename = getattr(app.state, "last_excel_filename", "부동산_실거래가.xlsx")
-    
-    if not excel_data:
-        return {"status": "error", "message": "다운로드할 데이터가 없습니다."}
-        
-    encoded_filename = urllib.parse.quote(filename)
-    return Response(
-        content=excel_data,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
-    )
-
 
 scheduler = BackgroundScheduler(timezone=KST)
 BATCH_WARMUP_TIMES = [(8, 10), (14, 40), (16, 40), (23, 40)]
