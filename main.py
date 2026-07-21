@@ -182,11 +182,14 @@ def _fetch_all_quant():
             except: pass
 
     try:
-        r_macro = supabase.table("macro_history").select("*").order("recorded_at", desc=True).limit(500).execute()
+        # 💡 수정: limit을 15000으로 늘려 5년치(약 9000건) 데이터를 모두 가져옵니다.
+        r_macro = supabase.table("macro_history").select("*").order("recorded_at", desc=True).limit(15000).execute()
         if r_macro.data:
             macro_map = {}
             for row in r_macro.data:
                 ind = row["indicator"]
+                date_str = str(row["recorded_at"])[:10]  # "2026-07-21" 형태 추출
+                
                 if ind not in macro_map:
                     macro_map[ind] = {
                         "id": str(row["id"]),
@@ -196,12 +199,17 @@ def _fetch_all_quant():
                         "value": float(row["value"] if row["value"] is not None else 0),
                         "change_percent": float(row["change_percent"] if row["change_percent"] is not None else 0),
                         "status": row["status"],
-                        "sparkline": []
+                        "sparkline": [],
+                        "history": [] # 💡 수정: 전체 차트용 히스토리 배열 추가
                     }
-                # 최신순 정렬이므로 역순으로 insert하여 과거->최신 배열(Sparkline 차트용) 생성
-                macro_map[ind]["sparkline"].insert(0, float(row["value"] if row["value"] is not None else 0))
+                
+                val = float(row["value"] if row["value"] is not None else 0)
+                
+                # 💡 과거->최신 순서로 정렬하기 위해 insert(0, ...) 사용
+                macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
+                macro_map[ind]["sparkline"].insert(0, val)
             
-            # 스파크라인 데이터 최근 20개 제한
+            # 스파크라인 데이터는 최근 20개만 남김
             for ind in macro_map:
                 macro_map[ind]["sparkline"] = macro_map[ind]["sparkline"][-20:]
             
