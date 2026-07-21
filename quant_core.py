@@ -43,6 +43,7 @@ TBL_DAILY   = "stock_daily"
 TBL_FUNDA   = "stock_fundamental"
 TBL_SCREEN  = "quant_screening_cache"
 TBL_WATCH   = "quant_watchlist_cache"
+TBL_SECTOR  = "stock_sector"   # [추가] 업종 분류 캐시 — 포트폴리오 섹터 분산용
 
 ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일봉부터 삭제)
 FUNDA_TTL_SEC  = 86400 * 90
@@ -167,6 +168,8 @@ def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
     close_col = next((c for c in ["Close", "종가"] if c in col), None)
     vol_col = next((c for c in ["Volume", "거래량"] if c in col), None)
     amt_col = next((c for c in ["Amount", "거래대금"] if c in col), None)
+    sector_col = next((c for c in ["Sector", "업종"] if c in col), None)
+    industry_col = next((c for c in ["Industry", "산업"] if c in col), None)
 
     df = pd.DataFrame({
         "Symbol": raw[sym].astype(str).str.zfill(6), "Name": raw[name].astype(str),
@@ -177,6 +180,9 @@ def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
     if amt_col: df["Amount"] = pd.to_numeric(raw[amt_col], errors="coerce").fillna(0)
     elif vol_col and close_col: df["Amount"] = pd.to_numeric(raw[vol_col], errors="coerce").fillna(0) * pd.to_numeric(raw[close_col], errors="coerce").fillna(0)
     else: df["Amount"] = 0
+    # [추가] 업종/산업 — fdr.StockListing이 기본 제공하는 컬럼이라 별도 API 호출 없이 그대로 실음
+    df["Sector"] = raw[sector_col].astype(str) if sector_col else ""
+    df["Industry"] = raw[industry_col].astype(str) if industry_col else ""
     return df
 
 def load_filtered_universe(marcap_min_억: int = PREFILTER_MARCAP_억, tvol_min_억: int = PREFILTER_TVOL_억) -> pd.DataFrame:
@@ -714,3 +720,148 @@ def load_backtest_result(supabase) -> dict:
             return json.loads(r.data[0]["results"])
     except: pass
     return {}
+
+# ══════════════════════════════════════════
+# [G] 포트폴리오 레벨 리스크 관리
+#   — 20년차 퀀트 리뷰에서 지적된 최대 약점(종목 단위 리스크만 있고 계좌 단위가 없음) 보완.
+#   여기 있는 값들은 전부 "가상 기준값"이며 실계좌 자동매매를 의미하지 않습니다.
+# ══════════════════════════════════════════
+VIRTUAL_TOTAL_CAPITAL   = 10_000_000   # 가상 총자본(원) — 모의 포트폴리오/백테스트 계산 기준값
+RISK_PER_TRADE_PCT      = 0.01         # 트레이드당 위험률 1% (손절 시 최대 손실 = 총자본의 1%)
+MAX_CONCURRENT_HOLDINGS = 10           # 동시 보유 종목 수 상한 (한 바구니에 몰빵 방지)
+MAX_POSITION_PCT        = 0.25         # 한 종목에 총자본의 25% 넘게 못 태움 (저변동성 종목 과대편입 방지)
+CORR_LOOKBACK_DAYS      = 40           # 상관관계 계산에 쓰는 최근 거래일수
+CORR_BLOCK_THRESHOLD    = 0.75         # 이 값 이상이면 "사실상 같은 베팅"으로 보고 신규진입 skip
+MAX_HOLDINGS_PER_SECTOR = 3            # 동시보유(10) 중 한 업종에 최대 이만큼만 (섹터 쏠림 방지)
+
+# 체결비용(수수료+세금+슬리피지) — 지금까지 백테스트에 빠져 있던 부분.
+# 국내주식 수수료(매수/매도 각 ~0.015%) + 매도 시 증권거래세(~0.18%) + "돌파를 쫓아 사는"
+# 전략 특성상 슬리피지를 편도 0.1~0.15%p 추가로 가정한 근사치입니다.
+ENTRY_COST_PCT = 0.15   # 매수 체결비용(수수료+슬리피지) — %p
+EXIT_COST_PCT  = 0.35   # 매도 체결비용(수수료+거래세+슬리피지) — %p
+
+
+def calc_position_size(entry_price: float, stop_price: float,
+                        total_capital: float = VIRTUAL_TOTAL_CAPITAL,
+                        risk_pct: float = RISK_PER_TRADE_PCT,
+                        max_position_pct: float = MAX_POSITION_PCT) -> dict:
+    """
+    리스크 기반(ATR) 포지션 사이징.
+    - 1주당 리스크(entry-stop) 기준으로, 이 트레이드가 손절 맞아도 총자본의 risk_pct%만
+      잃도록 수량을 정한다 (변동성 큰 종목은 수량이 자동으로 줄고, 변동성 낮은 종목은 늘어남).
+    - 다만 변동성이 너무 낮아 수량이 과도하게 커지는 걸 막기 위해, max_position_pct로
+      포지션 "금액" 상한도 같이 걸어서 한 종목에 자본이 과도하게 쏠리는 걸 막는다.
+    """
+    per_share_risk = max(entry_price - stop_price, 0)
+    if per_share_risk <= 0 or entry_price <= 0:
+        return {"quantity": 0, "position_value": 0, "risk_amount": 0, "capped_by": None}
+
+    risk_budget = total_capital * risk_pct
+    qty_by_risk = int(risk_budget // per_share_risk)
+
+    max_position_value = total_capital * max_position_pct
+    qty_by_cap = int(max_position_value // entry_price)
+
+    if qty_by_risk <= qty_by_cap:
+        quantity, capped_by = qty_by_risk, None
+    else:
+        quantity, capped_by = qty_by_cap, "max_position_pct"
+
+    quantity = max(quantity, 0)
+    position_value = quantity * entry_price
+    risk_amount = quantity * per_share_risk
+    return {
+        "quantity": quantity,
+        "position_value": round(position_value),
+        "risk_amount": round(risk_amount),
+        "capped_by": capped_by,
+    }
+
+
+def is_correlated_with_holdings(supabase, candidate_symbol: str, holding_symbols: list,
+                                 lookback: int = CORR_LOOKBACK_DAYS,
+                                 threshold: float = CORR_BLOCK_THRESHOLD) -> tuple:
+    """
+    포트폴리오 집중 리스크 방지용 필터.
+    후보 종목이 이미 보유 중인 종목과 최근 일간수익률 상관관계가 threshold 이상이면
+    "사실상 같은 베팅"(같은 섹터/테마일 가능성 높음)으로 보고 (True, 유사종목) 반환.
+    DB에 섹터 태그가 없어서, 가격 움직임 상관관계로 같은 테마 여부를 대신 판별하는 방식입니다.
+    """
+    if not holding_symbols:
+        return False, None
+    df_c = load_price_from_db(supabase, candidate_symbol)
+    if df_c.empty or len(df_c) < lookback + 1:
+        return False, None
+    ret_c = df_c["Close"].pct_change().tail(lookback)
+
+    for h_sym in holding_symbols:
+        if h_sym == candidate_symbol:
+            continue
+        df_h = load_price_from_db(supabase, h_sym)
+        if df_h.empty or len(df_h) < lookback + 1:
+            continue
+        ret_h = df_h["Close"].pct_change().tail(lookback)
+        joined = pd.concat([ret_c, ret_h], axis=1, join="inner").dropna()
+        if len(joined) < lookback * 0.6:
+            continue
+        corr = joined.iloc[:, 0].corr(joined.iloc[:, 1])
+        if corr is not None and corr >= threshold:
+            return True, h_sym
+    return False, None
+
+
+# ══════════════════════════════════════════
+# [G-1] 업종(섹터) 캐시 — 상관관계 프록시를 "진짜 업종 태그" 기반으로 보강
+#   fdr.StockListing()이 기본으로 Sector/Industry를 주기 때문에 별도 API 호출 없이,
+#   이미 매일 부르는 load_filtered_universe() 결과에 묻어와서 그대로 저장하면 된다.
+# ══════════════════════════════════════════
+def save_sector_cache(supabase, universe: pd.DataFrame):
+    """universe(load_filtered_universe 결과)에 실려온 Sector/Industry를 stock_sector에 upsert."""
+    if "Sector" not in universe.columns:
+        return 0
+    ts = now_kst_str()
+    rows = []
+    for _, row in universe.iterrows():
+        sector = str(row.get("Sector") or "").strip()
+        if not sector or sector.lower() == "nan":
+            continue
+        rows.append({
+            "symbol": row["Symbol"], "name": row.get("Name", row["Symbol"]),
+            "sector": sector, "industry": str(row.get("Industry") or "").strip(),
+            "updated_at": ts,
+        })
+    if not rows:
+        return 0
+    try:
+        # 대량 upsert — 한 번에 너무 많이 보내면 실패할 수 있어 500개 단위로 분할
+        for i in range(0, len(rows), 500):
+            supabase.table(TBL_SECTOR).upsert(rows[i:i+500]).execute()
+        return len(rows)
+    except Exception:
+        return 0
+
+
+def load_sector_map(supabase) -> dict:
+    """{symbol: sector} 딕셔너리로 로드 — 배치 1회 실행당 한 번만 불러서 재사용."""
+    try:
+        res = supabase.table(TBL_SECTOR).select("symbol,sector").execute()
+        return {r["symbol"]: r["sector"] for r in res.data if r.get("sector")}
+    except Exception:
+        return {}
+
+
+def is_sector_concentrated(candidate_symbol: str, sector_map: dict, holding_symbols: list,
+                            max_per_sector: int = MAX_HOLDINGS_PER_SECTOR) -> tuple:
+    """
+    후보 종목의 업종이, 이미 보유 중인 종목들 중 같은 업종 개수가 상한(max_per_sector)에
+    도달했으면 (True, 업종명)을 반환 — 섹터 단위 쏠림 리스크 방지.
+    업종 정보가 없는 종목은 이 필터를 통과시키고 is_correlated_with_holdings()에 판단을 맡긴다
+    (섹터 태그 유무와 무관하게 항상 최소한의 분산 체크가 걸리도록 하기 위함).
+    """
+    cand_sector = sector_map.get(candidate_symbol)
+    if not cand_sector:
+        return False, None
+    same_sector_count = sum(1 for h in holding_symbols if sector_map.get(h) == cand_sector)
+    if same_sector_count >= max_per_sector:
+        return True, cand_sector
+    return False, None
