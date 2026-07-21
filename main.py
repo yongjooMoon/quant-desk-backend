@@ -180,6 +180,38 @@ def _fetch_all_quant():
                 if row["id"] == 1: data["confirmed"] = res_json
                 elif row["id"] == 2: data["watchlist"] = res_json
             except: pass
+
+    try:
+        r_macro = supabase.table("macro_history").select("*").order("recorded_at", desc=True).limit(500).execute()
+        if r_macro.data:
+            macro_map = {}
+            for row in r_macro.data:
+                ind = row["indicator"]
+                if ind not in macro_map:
+                    macro_map[ind] = {
+                        "id": str(row["id"]),
+                        "indicator": ind,
+                        "name": row["name"],
+                        "category": row["category"],
+                        "value": float(row["value"] if row["value"] is not None else 0),
+                        "change_percent": float(row["change_percent"] if row["change_percent"] is not None else 0),
+                        "status": row["status"],
+                        "sparkline": []
+                    }
+                # 최신순 정렬이므로 역순으로 insert하여 과거->최신 배열(Sparkline 차트용) 생성
+                macro_map[ind]["sparkline"].insert(0, float(row["value"] if row["value"] is not None else 0))
+            
+            # 스파크라인 데이터 최근 20개 제한
+            for ind in macro_map:
+                macro_map[ind]["sparkline"] = macro_map[ind]["sparkline"][-20:]
+            
+            data["macro"] = list(macro_map.values())
+        else:
+            data["macro"] = []
+    except Exception as e:
+        print(f"Macro fetch error: {e}")
+        data["macro"] = []
+
     return data
 
 def refresh_quant_cache():
