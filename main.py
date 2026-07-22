@@ -22,7 +22,12 @@ import pandas as pd
 from cryptography.fernet import Fernet
 
 # 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
-from quant_core import load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst, load_fundamental_from_db, save_fundamental_to_db
+from quant_core import (
+    load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst,
+    load_fundamental_from_db, save_fundamental_to_db,
+    # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
+    evaluate_entry_gates, get_index_return_pct,
+)
 from real_estate import generate_excel_data
 
 load_dotenv()
@@ -134,6 +139,10 @@ quant_smart_cache = SmartCache()
 
 krx_cache = TTLCache(maxsize=5, ttl=86400)
 funda_cache = TTLCache(maxsize=3000, ttl=50)
+
+# 🧪 [추가] 시장 지수(KOSPI/KOSDAQ) 60일 수익률(RS 벤치마크) 캐시 — 종목 검색마다 fdr을
+#    다시 호출하지 않도록 짧은 TTL로 캐싱 (배치와 동일한 get_index_return_pct 사용)
+index_return_cache = TTLCache(maxsize=2, ttl=600)
 
 def _get_latest_news_ts():
     res = supabase.table("market_news").select("created_at").order("created_at", desc=True).limit(1).execute()
@@ -297,6 +306,45 @@ def get_krx_list(refresh: str = "false"):
 # ==============================================================================
 # ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API 
 # ==============================================================================
+
+# 🧪 [추가] 오늘 배치가 이미 스크리닝해 둔 confirmed/watchlist 캐시에서 종목을 찾는다.
+#    있으면 그 결과(정확한 factor_score + filter_details)를 그대로 재사용해서 중복계산을 피한다.
+def _find_in_screening_cache(symbol: str) -> Optional[dict]:
+    with quant_smart_cache.lock:
+        cache_data = quant_smart_cache.data
+    if not cache_data:
+        return None
+    for c in (cache_data.get("confirmed") or []):
+        if c.get("symbol") == symbol:
+            return c
+    for c in (cache_data.get("watchlist") or []):
+        if c.get("symbol") == symbol:
+            return c
+    return None
+
+# 🧪 [추가] quant_core.run_screening_from_db()가 candidate["filter_details"]에 저장하는
+#    {"Growth Composite": {...}, "Dynamic MDD": {...}, ...} 형태를 프론트가 기대하는
+#    {'A': {...}, 'B': {...}, ...} 형태로 변환 (evaluate_entry_gates()의 반환 형식과 동일하게 맞춤)
+def _map_filter_details_to_gates(filter_details: dict) -> dict:
+    labels = ['A', 'B', 'C', 'D', 'E', 'F']
+    mapped = {}
+    for i, (name, detail) in enumerate(filter_details.items()):
+        if i >= len(labels):
+            break
+        mapped[labels[i]] = {"name": name, "pass": detail.get("pass", False), "reason": detail.get("reason", "")}
+    return mapped
+
+# 🧪 [추가] 배치(quant_cron.py)와 동일하게 시장별(KOSPI/KOSDAQ) RS 벤치마크를 분리해서 조회.
+#    fdr 호출 비용을 줄이기 위해 10분 TTL 캐시를 둔다.
+def _get_benchmark_return(is_kosdaq: bool) -> float:
+    key = "KQ11" if is_kosdaq else "KS11"
+    if key in index_return_cache:
+        return index_return_cache[key]
+    val = get_index_return_pct(key)
+    index_return_cache[key] = val
+    return val
+
+
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
@@ -434,33 +482,7 @@ def search_stock(symbol: str, t: Optional[str] = None):
             if len(df_price) >= 2: ret_1d = ((curr_price - float(df_price['Close'].iloc[-2])) / float(df_price['Close'].iloc[-2]) * 100)
             if len(df_price) >= 21: ret_1m = ((curr_price - float(df_price['Close'].iloc[-21])) / float(df_price['Close'].iloc[-21]) * 100)
 
-            naver_fund = fetch_naver_fundamental(symbol)
-            sector = naver_fund.get("sector", "") if naver_fund else ""
-
-            metrics = calc_quant_metrics(df_price, naver_fund)
-            score = 0.0
-            gates = {}
-
-            if metrics and metrics.get("ma20", 0) > 0:
-                f_growth = bool(metrics["growth_composite"] > 0)
-                f_mdd    = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
-                f_liq    = bool(metrics["liquidity_20d"] >= 50)
-                f_trend  = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]))
-                f_break  = bool(curr_price >= (metrics["high_60d"] * 0.90))
-                f_vol    = bool(metrics["vol_5d"] > (metrics["vol_60d"] * 1.5))
-
-                gates = {
-                    'A': {'name': 'Growth Composite', 'pass': f_growth, 'reason': f"Comp {metrics.get('growth_composite',0):+.1f}%"},
-                    'B': {'name': 'Dynamic MDD', 'pass': f_mdd, 'reason': f"MDD {metrics.get('mdd',0):.1f}% (Limit: {metrics.get('dynamic_mdd_limit',0):.1f}%)"},
-                    'C': {'name': 'Liquidity', 'pass': f_liq, 'reason': f"{metrics.get('liquidity_20d',0):,.0f}억"},
-                    'D': {'name': 'Trend Alignment', 'pass': f_trend, 'reason': "Price > 20MA > 60MA" if f_trend else "추세 미달"},
-                    'E': {'name': 'Price Breakout', 'pass': f_break, 'reason': f"고점대비 {(curr_price/metrics.get('high_60d',1))*100:.1f}%" if metrics.get('high_60d') else "-"},
-                    'F': {'name': 'Volume Surge', 'pass': f_vol, 'reason': f"Vol {metrics.get('vol_5d',0)/metrics.get('vol_60d',1):.1f}x 급증" if metrics.get('vol_60d') else "-"}
-                }
-                pass_count = sum([1 for g in gates.values() if g['pass']])
-                mom = ((curr_price - metrics["ma60"]) / metrics["ma60"] * 100) if metrics["ma60"] > 0 else 0
-                score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, metrics.get("net_yoy", 0)/5)) + min(25, max(0, mom)))))
-
+            # 종목명/시장(코스피·코스닥) — 벤치마크 선택과 DB 저장에 필요해서 먼저 조회
             r_krx = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
             stock_name = symbol
             market = "KOSPI"
@@ -471,9 +493,46 @@ def search_stock(symbol: str, t: Optional[str] = None):
                     stock_name = matched.get("Name", symbol)
                     market = matched.get("Market", "KOSPI")
 
+            # ── 🧪 [1] 오늘 배치 스크리닝(confirmed/watchlist)에 이미 있는 종목이면
+            #          그 결과(정확한 factor_score + filter_details)를 그대로 사용
+            cached_screen = _find_in_screening_cache(symbol)
+
+            # ── 🧪 [2] DB에 캐시된 펀더멘탈(배치가 DART+네이버 조합해 저장, 90일 TTL) 우선 사용
+            fund = load_fundamental_from_db(supabase, symbol)
+            if fund is None:
+                # ── 🧪 [3] 캐시도 없을 때만 네이버 실시간 스크래핑 + 다음부터 쓰도록 DB에 저장
+                fund = fetch_naver_fundamental(symbol) or {}
+                try:
+                    if fund:
+                        save_fundamental_to_db(supabase, symbol, stock_name, fund)
+                except Exception as e:
+                    print(f"펀더멘탈 캐시 저장 실패({symbol}): {e}")
+
+            sector = fund.get("sector", "") if fund else ""
+
+            if cached_screen is not None:
+                # 배치가 이미 계산해 둔 정확한 랭킹 스코어/게이트를 그대로 사용 (중복계산 방지 + 완전 동일 로직 보장)
+                score = float(cached_screen.get("factor_score", 0.0))
+                gates = _map_filter_details_to_gates(cached_screen.get("filter_details", {}))
+            else:
+                # ── 🧪 [4] 배치 대상이 아니었던 종목(예: 이미 보유 중이라 오늘 스크리닝 유니버스에서
+                #          빠진 종목)은 core의 실제 추격매수 전략(evaluate_entry_gates)을 그대로 호출
+                is_kosdaq = str(market).upper().startswith("KOSDAQ")
+                benchmark_ret = _get_benchmark_return(is_kosdaq)
+                gate_result = evaluate_entry_gates(df_price, fund, benchmark_ret_60d=benchmark_ret)
+
+                if gate_result:
+                    gates = gate_result["gates"]
+                    pass_count = gate_result["pass_count"]
+                    metrics = gate_result["metrics"]
+                    mom = ((curr_price - metrics["ma60"]) / metrics["ma60"] * 100) if metrics["ma60"] > 0 else 0
+                    score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, metrics.get("net_yoy", 0)/5)) + min(25, max(0, mom)))))
+                else:
+                    gates, score = {}, 0.0
+
             result_data = {
                 "symbol": symbol, "name": stock_name, "current_price": curr_price, "ret_1d": ret_1d, "ret_1m": ret_1m,
-                "score": score, "gates": gates, "fundamental": naver_fund, "chart_data": chart_data,
+                "score": score, "gates": gates, "fundamental": fund, "chart_data": chart_data,
                 "market": market, "sector": sector, "market_status": "장마감"
             }
             funda_cache[symbol] = result_data
