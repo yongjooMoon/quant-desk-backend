@@ -543,6 +543,55 @@ def search_stock(symbol: str, t: Optional[str] = None):
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
+@app.get("/api/macro")
+def get_macro_dashboard():
+    if not supabase: 
+        return {"status": "error", "message": "DB 설정 안됨"}
+    
+    try:
+        # 1. 매크로 테이블에서 전체(최대 5년치) 데이터 조회
+        r_macro = supabase.table("macro_market_data").select("*").order("recorded_at", desc=True).limit(15000).execute()
+        
+        if not r_macro.data:
+            return {"status": "success", "data": []}
+            
+        macro_map = {}
+        for row in r_macro.data:
+            ind = row["indicator"]
+            date_str = str(row["recorded_at"])[:10]
+            val = float(row["value"] if row["value"] is not None else 0)
+            
+            if ind not in macro_map:
+                macro_map[ind] = {
+                    "indicator": ind,
+                    "display_name": row.get("display_name", ind),
+                    "source": row.get("source", ""),
+                    "value": val,
+                    "unit": row.get("unit", ""),
+                    "signal": row.get("signal") if row.get("signal") else "neutral",
+                    "recorded_at": date_str,
+                    "change_percent": 0.0,
+                    "history": []
+                }
+            
+            # 2. 시계열 차트를 위해 과거->최신 순서로 배열 앞쪽에 삽입
+            macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
+        
+        # 3. 최근 2거래일 데이터를 비교하여 등락률(change_percent) 계산
+        for ind in macro_map:
+            hist = macro_map[ind]["history"]
+            if len(hist) >= 2:
+                last_val = hist[-1]["value"]
+                prev_val = hist[-2]["value"]
+                if prev_val != 0:
+                    macro_map[ind]["change_percent"] = ((last_val - prev_val) / prev_val) * 100
+                    
+        return {"status": "success", "data": list(macro_map.values())}
+        
+    except Exception as e:
+        print(f"Macro fetch error: {e}")
+        return {"status": "error", "message": str(e)}
+        
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
 # ==============================================================================
