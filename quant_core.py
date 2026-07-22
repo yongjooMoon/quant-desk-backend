@@ -865,3 +865,81 @@ def is_sector_concentrated(candidate_symbol: str, sector_map: dict, holding_symb
     if same_sector_count >= max_per_sector:
         return True, cand_sector
     return False, None
+
+def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0) -> dict:
+    """
+    단일 종목에 대해 실시간 추격매수 6관문(Gates) 통과 여부를 판정합니다.
+    (배치 모듈의 run_screening_from_db와 100% 동일한 로직과 파라미터를 사용)
+    UI의 실시간 검색(Search) 리포트에서 사용됩니다.
+    """
+    if df.empty or len(df) < 60:
+        return None
+
+    # 1. 퀀트 지표 산출
+    metrics = calc_quant_metrics(df, fund, benchmark_ret_60d=benchmark_ret_60d)
+    if "ma20" not in metrics or metrics["ma20"] == 0:
+        return None
+
+    curr_price = int(df["Close"].iloc[-1])
+    prev_price = int(df["Close"].iloc[-2]) if len(df) >= 2 else curr_price
+    today_vol  = df["Volume"].iloc[-1]
+    breakout_threshold = metrics["high_60d"] * 0.90
+
+    # 2. 6관문(Gates) 조건 판정 (배치 엔진과 완벽히 동일)
+    f_growth = metrics["growth_composite"] > 0
+    f_mdd    = metrics["mdd"] >= metrics["dynamic_mdd_limit"]
+    f_liq    = metrics["liquidity_20d"] >= 50
+    f_trend  = (curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
+               and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100))
+
+    f_break_confirmed = (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold)
+    f_break_strong_day1 = (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT))
+    f_break = f_break_confirmed or f_break_strong_day1
+
+    f_vol = (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT))
+
+    pass_count = sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol])
+
+    # 0으로 나누는 오류 방지용 안전 장치
+    high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
+    vol_60d_val = metrics["vol_60d"] if metrics["vol_60d"] > 0 else 1
+
+    # 3. 프론트엔드 포맷 (A~F) 맵핑
+    gates = {
+        "A": {
+            "name": "Growth Composite",
+            "pass": f_growth,
+            "reason": f"Comp {metrics['growth_composite']:+.1f}%"
+        },
+        "B": {
+            "name": "Dynamic MDD",
+            "pass": f_mdd,
+            "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"
+        },
+        "C": {
+            "name": "Liquidity",
+            "pass": f_liq,
+            "reason": f"{metrics['liquidity_20d']:.0f}억"
+        },
+        "D": {
+            "name": "Trend Alignment",
+            "pass": f_trend,
+            "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"
+        },
+        "E": {
+            "name": "Price Breakout",
+            "pass": f_break,
+            "reason": f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1 else f"고점대비 {(curr_price/high_60d_val)*100:.1f}% (2일 연속 돌파권)"
+        },
+        "F": {
+            "name": "Volume Surge",
+            "pass": f_vol,
+            "reason": f"Vol {(metrics['vol_5d']/vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"
+        }
+    }
+
+    return {
+        "pass_count": pass_count,
+        "gates": gates,
+        "metrics": metrics
+    }
