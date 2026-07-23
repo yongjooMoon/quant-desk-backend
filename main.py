@@ -551,7 +551,7 @@ def get_macro_dashboard():
     try:
         # 1. 매크로 테이블에서 전체(최대 5년치) 데이터 조회
         r_macro = supabase.table("macro_market_data").select("*").order("recorded_at", desc=True).limit(15000).execute()
-        len(r_macro.data)
+        print(len(r_macro.data))
         if not r_macro.data:
             return {"status": "success", "data": []}
             
