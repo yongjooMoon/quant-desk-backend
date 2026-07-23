@@ -504,23 +504,24 @@ def search_stock(symbol: str, t: Optional[str] = None):
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
+NDICATORS = [
+    "QQQ_PRICE", "QQQ_MA50", "QQQ_MA200", "QQQ_MA200_SLOPE",
+    "REAL_YIELD_10Y", "CREDIT_SPREAD", "VIX", "WTI", "FEAR_GREED"
+]
+
 @app.get("/api/macro")
 def get_macro_dashboard():
-    if not supabase: 
+    if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
-    
-    try:
-        # 1. 지표 목록 먼저 조회
-        r_indicators = supabase.table("macro_market_data").select("indicator").execute()
-        indicators = sorted(set(row["indicator"] for row in r_indicators.data))
 
+    try:
         macro_map = {}
-        for ind in indicators:
+        for ind in INDICATORS:
             r = (supabase.table("macro_market_data")
                  .select("*")
                  .eq("indicator", ind)
                  .order("recorded_at", desc=True)
-                 .limit(1300)   # 지표별로 5년치(약 1260 거래일) 여유있게 확보
+                 .limit(1300)
                  .execute())
 
             if not r.data:
@@ -544,13 +545,10 @@ def get_macro_dashboard():
                     }
                 macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
 
-            # value/recorded_at을 최신 데이터로 갱신 (가장 최근 row 기준)
-            if r.data:
-                latest = r.data[0]
-                macro_map[ind]["value"] = float(latest["value"] if latest["value"] is not None else 0)
-                macro_map[ind]["recorded_at"] = str(latest["recorded_at"])[:10]
+            latest = r.data[0]
+            macro_map[ind]["value"] = float(latest["value"] if latest["value"] is not None else 0)
+            macro_map[ind]["recorded_at"] = str(latest["recorded_at"])[:10]
 
-        # 2. change_percent 계산
         for ind in macro_map:
             hist = macro_map[ind]["history"]
             if len(hist) >= 2:
@@ -560,7 +558,7 @@ def get_macro_dashboard():
                     macro_map[ind]["change_percent"] = ((last_val - prev_val) / prev_val) * 100
 
         return {"status": "success", "data": list(macro_map.values())}
-        
+
     except Exception as e:
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
