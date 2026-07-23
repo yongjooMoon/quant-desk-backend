@@ -503,6 +503,11 @@ def search_stock(symbol: str, t: Optional[str] = None):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
+        
+INDICATORS = [
+    "QQQ_PRICE", "QQQ_MA50", "QQQ_MA200", "QQQ_MA200_SLOPE",
+    "REAL_YIELD_10Y", "CREDIT_SPREAD", "VIX", "WTI", "FEAR_GREED"
+]
 
 @app.get("/api/macro")
 def get_macro_dashboard():
