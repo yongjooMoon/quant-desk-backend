@@ -190,6 +190,45 @@ def _fetch_all_quant():
                 elif row["id"] == 2: data["watchlist"] = res_json
             except: pass
 
+    try:
+        # 💡 수정: limit을 15000으로 늘려 5년치(약 9000건) 데이터를 모두 가져옵니다.
+        r_macro = supabase.table("macro_history").select("*").order("recorded_at", desc=True).limit(15000).execute()
+        if r_macro.data:
+            macro_map = {}
+            for row in r_macro.data:
+                ind = row["indicator"]
+                date_str = str(row["recorded_at"])[:10]  # "2026-07-21" 형태 추출
+                
+                if ind not in macro_map:
+                    macro_map[ind] = {
+                        "id": str(row["id"]),
+                        "indicator": ind,
+                        "name": row["name"],
+                        "category": row["category"],
+                        "value": float(row["value"] if row["value"] is not None else 0),
+                        "change_percent": float(row["change_percent"] if row["change_percent"] is not None else 0),
+                        "status": row["status"],
+                        "sparkline": [],
+                        "history": [] # 💡 수정: 전체 차트용 히스토리 배열 추가
+                    }
+                
+                val = float(row["value"] if row["value"] is not None else 0)
+                
+                # 💡 과거->최신 순서로 정렬하기 위해 insert(0, ...) 사용
+                macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
+                macro_map[ind]["sparkline"].insert(0, val)
+            
+            # 스파크라인 데이터는 최근 20개만 남김
+            for ind in macro_map:
+                macro_map[ind]["sparkline"] = macro_map[ind]["sparkline"][-20:]
+            
+            data["macro"] = list(macro_map.values())
+        else:
+            data["macro"] = []
+    except Exception as e:
+        print(f"Macro fetch error: {e}")
+        data["macro"] = []
+
     return data
 
 def refresh_quant_cache():
@@ -504,24 +543,23 @@ def search_stock(symbol: str, t: Optional[str] = None):
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-NDICATORS = [
-    "QQQ_PRICE", "QQQ_MA50", "QQQ_MA200", "QQQ_MA200_SLOPE",
-    "REAL_YIELD_10Y", "CREDIT_SPREAD", "VIX", "WTI", "FEAR_GREED"
-]
-
 @app.get("/api/macro")
 def get_macro_dashboard():
-    if not supabase:
+    if not supabase: 
         return {"status": "error", "message": "DB 설정 안됨"}
-
+    
     try:
+        # 1. 지표 목록 먼저 조회
+        r_indicators = supabase.table("macro_market_data").select("indicator").execute()
+        indicators = sorted(set(row["indicator"] for row in r_indicators.data))
+
         macro_map = {}
-        for ind in INDICATORS:
+        for ind in indicators:
             r = (supabase.table("macro_market_data")
                  .select("*")
                  .eq("indicator", ind)
                  .order("recorded_at", desc=True)
-                 .limit(1300)
+                 .limit(1300)   # 지표별로 5년치(약 1260 거래일) 여유있게 확보
                  .execute())
 
             if not r.data:
@@ -545,10 +583,13 @@ def get_macro_dashboard():
                     }
                 macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
 
-            latest = r.data[0]
-            macro_map[ind]["value"] = float(latest["value"] if latest["value"] is not None else 0)
-            macro_map[ind]["recorded_at"] = str(latest["recorded_at"])[:10]
+            # value/recorded_at을 최신 데이터로 갱신 (가장 최근 row 기준)
+            if r.data:
+                latest = r.data[0]
+                macro_map[ind]["value"] = float(latest["value"] if latest["value"] is not None else 0)
+                macro_map[ind]["recorded_at"] = str(latest["recorded_at"])[:10]
 
+        # 2. change_percent 계산
         for ind in macro_map:
             hist = macro_map[ind]["history"]
             if len(hist) >= 2:
@@ -558,7 +599,7 @@ def get_macro_dashboard():
                     macro_map[ind]["change_percent"] = ((last_val - prev_val) / prev_val) * 100
 
         return {"status": "success", "data": list(macro_map.values())}
-
+        
     except Exception as e:
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
