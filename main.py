@@ -504,58 +504,67 @@ def search_stock(symbol: str, t: Optional[str] = None):
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-INDICATORS = [
-    "QQQ_PRICE", "QQQ_MA50", "QQQ_MA200", "QQQ_MA200_SLOPE",
-    "REAL_YIELD_10Y", "CREDIT_SPREAD", "VIX", "WTI", "FEAR_GREED"
-]
-
 @app.get("/api/macro")
 def get_macro_dashboard():
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
 
     try:
+        # 1. 한 번의 쿼리로 여러 indicator 데이터를 모두 가져옵니다.
+        # 지표 개수 * 1300개 만큼 넉넉하게 limit를 설정합니다.
+        total_limit = len(INDICATORS) * 1300
+        
+        r = (supabase.table("macro_market_data")
+             .select("*")
+             .in_("indicator", INDICATORS)
+             .order("recorded_at", desc=True)
+             .limit(total_limit)
+             .execute())
+
+        if not r.data:
+            return {"status": "success", "data": []}
+
         macro_map = {}
-        for ind in INDICATORS:
-            r = (supabase.table("macro_market_data")
-                 .select("*")
-                 .eq("indicator", ind)
-                 .order("recorded_at", desc=True)
-                 .limit(1300)
-                 .execute())
+        count_map = {}
 
-            if not r.data:
+        # 2. 단일 쿼리로 가져온 전체 데이터를 순회하며 지표별로 분류합니다.
+        for row in r.data:
+            ind = row["indicator"]
+            
+            # 각 지표(indicator)별로 1300개까지만 담도록 제한
+            if count_map.get(ind, 0) >= 1300:
                 continue
+                
+            date_str = str(row["recorded_at"])[:10]
+            val = float(row["value"] if row["value"] is not None else 0)
 
-            for row in r.data:
-                date_str = str(row["recorded_at"])[:10]
-                val = float(row["value"] if row["value"] is not None else 0)
+            # 지표가 처음 등장했을 때 기본 구조 초기화 (desc 정렬이므로 첫 등장이 가장 최신 데이터)
+            if ind not in macro_map:
+                macro_map[ind] = {
+                    "indicator": ind,
+                    "display_name": row.get("display_name", ind),
+                    "source": row.get("source", ""),
+                    "value": val,
+                    "unit": row.get("unit", ""),
+                    "signal": row.get("signal") if row.get("signal") else "neutral",
+                    "recorded_at": date_str,
+                    "change_percent": 0.0,
+                    "history": []
+                }
+                count_map[ind] = 0
+            
+            # 과거 데이터가 배열 앞쪽(index 0)으로 가도록 insert (오름차순 정렬을 위함)
+            macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
+            count_map[ind] += 1
 
-                if ind not in macro_map:
-                    macro_map[ind] = {
-                        "indicator": ind,
-                        "display_name": row.get("display_name", ind),
-                        "source": row.get("source", ""),
-                        "value": val,
-                        "unit": row.get("unit", ""),
-                        "signal": row.get("signal") if row.get("signal") else "neutral",
-                        "recorded_at": date_str,
-                        "change_percent": 0.0,
-                        "history": []
-                    }
-                macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
-
-            latest = r.data[0]
-            macro_map[ind]["value"] = float(latest["value"] if latest["value"] is not None else 0)
-            macro_map[ind]["recorded_at"] = str(latest["recorded_at"])[:10]
-
-        for ind in macro_map:
-            hist = macro_map[ind]["history"]
+        # 3. 전일 대비 증감률(change_percent) 계산
+        for ind, data in macro_map.items():
+            hist = data["history"]
             if len(hist) >= 2:
-                last_val = hist[-1]["value"]
-                prev_val = hist[-2]["value"]
+                last_val = hist[-1]["value"]  # 최신값 (배열 맨 끝)
+                prev_val = hist[-2]["value"]  # 직전값
                 if prev_val != 0:
-                    macro_map[ind]["change_percent"] = ((last_val - prev_val) / prev_val) * 100
+                    data["change_percent"] = ((last_val - prev_val) / prev_val) * 100
 
         return {"status": "success", "data": list(macro_map.values())}
 
