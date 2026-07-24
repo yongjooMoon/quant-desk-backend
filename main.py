@@ -645,6 +645,72 @@ def download_realestate():
 scheduler = BackgroundScheduler(timezone=KST)
 BATCH_WARMUP_TIMES = [(8, 10), (14, 40), (16, 40), (23, 40)]
 
+# ==============================================================================
+# 🏢 6. 청약 분양 아파트 캘린더 조
+# ==============================================================================
+def parse_flexible_date(date_str):
+    """'2026.07.31', '2026-07-31', '20260731' 등 다양한 포맷을 date로 파싱"""
+    if not date_str:
+        return None
+    clean = re.sub(r'[^0-9]', '', str(date_str))[:8]
+    try:
+        return datetime.strptime(clean, '%Y%m%d').date()
+    except ValueError:
+        return None
+
+@app.get("/api/home/search")
+def get_home_calendar(year: int = Query(...), month: int = Query(...)):
+    try:
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year + 1}-01-01" if month == 12 else f"{year}-{month + 1:02d}-01"
+ 
+        # 1) 청약홈(applyhome) — scheduled_date가 실제 date 컬럼이므로 DB에서 바로 범위 조회
+        applyhome_res = (
+            supabase.table("housing_listings")
+            .select("*")
+            .eq("source", "applyhome")
+            .gte("scheduled_date", start_date)
+            .lt("scheduled_date", end_date)
+            .execute()
+        )
+ 
+        # 2) LH — closing_date(마감일)가 텍스트 컬럼이라 DB 범위조회 대신 전체를 가져와 파이썬에서 필터링
+        lh_res = (
+            supabase.table("housing_listings")
+            .select("*")
+            .eq("source", "lh")
+            .execute()
+        )
+ 
+        results = []
+ 
+        for row in applyhome_res.data:
+            results.append({
+                "id": row["id"],
+                "name": row["name"],
+                "url": row["url"],
+                "badge": row["badge"],
+                "source": row["source"],
+                "date": row["scheduled_date"],
+            })
+ 
+        for row in lh_res.data:
+            d = parse_flexible_date(row.get("closing_date"))
+            if d and d.year == year and d.month == month:
+                results.append({
+                    "id": row["id"],
+                    "name": row["name"],
+                    "url": row["url"],
+                    "badge": "LH",
+                    "source": row["source"],
+                    "date": d.isoformat(),
+                })
+ 
+        return {"status": "success", "data": results}
+ 
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 def _warmup_all():
     refresh_news_cache()
     refresh_quant_cache()
