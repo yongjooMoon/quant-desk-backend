@@ -646,7 +646,7 @@ scheduler = BackgroundScheduler(timezone=KST)
 BATCH_WARMUP_TIMES = [(8, 10), (14, 40), (16, 40), (23, 40)]
 
 # ==============================================================================
-# 🏢 6. 청약 분양 아파트 캘린더 조
+# 🏢 6. 청약 분양 아파트 캘린더 조회
 # ==============================================================================
 def parse_flexible_date(date_str):
     """'2026.07.31', '2026-07-31', '20260731' 등 다양한 포맷을 date로 파싱"""
@@ -659,7 +659,7 @@ def parse_flexible_date(date_str):
         return None
 
 @app.get("/api/home/search")
-def get_home_calendar(year: int = Query(...), month: int = Query(...)):
+def get_home_calendar(year: int, month: int):
     try:
         start_date = f"{year}-{month:02d}-01"
         end_date = f"{year + 1}-01-01" if month == 12 else f"{year}-{month + 1:02d}-01"
