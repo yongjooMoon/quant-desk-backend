@@ -18,6 +18,7 @@ from typing import Optional, List
 from cachetools import TTLCache, cached
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
+import re
 
 from cryptography.fernet import Fernet
 
