@@ -577,6 +577,25 @@ def get_macro_dashboard():
     except Exception as e:
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
+
+BACKTEST_CACHE_ID = 11
+
+backtest_result_cache = TTLCache(maxsize=1, ttl=300)  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
+
+@app.get("/api/backtesting/result")
+@cached(cache=backtest_result_cache)
+def get_backtesting_result(refresh: str = "false"):
+    if refresh.lower() == "true":
+        backtest_result_cache.clear()
+    if not supabase:
+        return {"status": "error", "message": "DB 설정 안됨"}
+    try:
+        res = supabase.table("quant_screening_cache").select("results").eq("id", BACKTEST_CACHE_ID).execute()
+        if res.data and res.data[0].get("results"):
+            return {"status": "success", "data": json.loads(res.data[0]["results"])}
+        return {"status": "success", "data": []}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
         
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
