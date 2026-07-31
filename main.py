@@ -578,7 +578,7 @@ def get_macro_dashboard():
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
 
-BACKTEST_CACHE_ID = 11
+BACKTEST_CACHE_ID = 14
 
 backtest_result_cache = TTLCache(maxsize=1, ttl=300)  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
 
