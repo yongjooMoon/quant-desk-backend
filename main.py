@@ -256,14 +256,41 @@ def get_quant_dashboard(refresh: str = "false"):
 @app.get("/api/krx-list")
 @cached(cache=krx_cache)
 def get_krx_list(refresh: str = "false"):
-    if refresh.lower() == "true": krx_cache.clear()
-    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    iif refresh.lower() == "true":
+        krx_cache.clear()
     try:
-        res = supabase.table("quant_screening_cache").select("results").eq("id", 99).execute()
-        if res.data: return {"status": "success", "data": json.loads(res.data[0]["results"])}
-        return {"status": "success", "data": []}
-    except Exception as e: return {"status": "error", "message": str(e)}
+        df = build_search_universe()
+        records = [
+            {
+                "Symbol": row["Symbol"],
+                "Name": row["Name"],
+                "Market": row.get("Market", "-"),
+                "SearchStr": f'{row["Name"]} ({row["Symbol"]})',
+            }
+            for _, row in df.iterrows()
+        ]
+        return {"status": "success", "data": records}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
+def build_search_universe() -> pd.DataFrame:
+    """
+    검색 드롭다운(/api/krx-list) 전용 전체 종목 리스트.
+    quant_cron의 전략 유니버스(marcap_min_억/tvol_min_억로 걸러진 것)와는 완전히 별개다.
+    검색은 매매 후보가 아니라 "존재하는 모든 종목"을 찾는 기능이므로,
+    ETF/ETN/스팩/리츠/우선주만 제외하고 시총·거래대금 하한은 적용하지 않는다.
+    """
+    kospi = _normalize_listing(fdr.StockListing("KOSPI"), "KOSPI")
+    kosdaq = _normalize_listing(fdr.StockListing("KOSDAQ"), "KOSDAQ")
+    raw_df = pd.concat([kospi, kosdaq], ignore_index=True)
+    raw_df = raw_df[raw_df["Symbol"].str.len() == 6].dropna(subset=["Symbol", "Name"])
+
+    exclude_kw = ["ETF", "ETN", "스팩", "리츠", "REIT", "인프라", "선박"]
+    mask_name = raw_df["Name"].str.contains("|".join(exclude_kw), na=False)
+    mask_preferred = raw_df["Symbol"].str[-1] != "0"  # 우선주 제외 — 검색에서도 보통주만
+    common = raw_df[~mask_name & ~mask_preferred].copy()
+
+    return common.reset_index(drop=True)
 
 # ==============================================================================
 # ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API 
