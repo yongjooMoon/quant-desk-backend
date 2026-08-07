@@ -27,7 +27,7 @@ from quant_core import (
     load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst,
     load_fundamental_from_db, save_fundamental_to_db,
     # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
-    evaluate_entry_gates, get_index_return_pct, build_search_universe,
+    evaluate_entry_gates, get_index_return_pct, load_filtered_universe,
 )
 from real_estate import generate_excel_data
 
@@ -258,7 +258,7 @@ def get_krx_list(refresh: str = "false"):
     if refresh.lower() == "true":
         krx_cache.clear()
     try:
-        df = build_search_universe()
+        df = load_filtered_universe()
         records = [
             {
                 "Symbol": row["Symbol"],
