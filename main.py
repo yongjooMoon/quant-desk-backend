@@ -252,6 +252,30 @@ def get_quant_dashboard(refresh: str = "false"):
         return {"status": "success", "data": data, "cached": False}
     except Exception as e: return {"status": "error", "message": str(e)}
 
+def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
+    col = raw.columns.tolist()
+    sym = next((c for c in ["Symbol", "Code", "Ticker"] if c in col), None)
+    name = next((c for c in ["Name", "종목명"] if c in col), None)
+    cap = next((c for c in ["Marcap", "시가총액"] if c in col), None)
+    close_col = next((c for c in ["Close", "종가"] if c in col), None)
+    vol_col = next((c for c in ["Volume", "거래량"] if c in col), None)
+    amt_col = next((c for c in ["Amount", "거래대금"] if c in col), None)
+    sector_col = next((c for c in ["Sector", "업종"] if c in col), None)
+    industry_col = next((c for c in ["Industry", "산업"] if c in col), None)
+
+    df = pd.DataFrame({
+        "Symbol": raw[sym].astype(str).str.zfill(6), "Name": raw[name].astype(str),
+        "Market": market,
+        "Marcap": pd.to_numeric(raw[cap], errors="coerce") if cap else 0,
+        "Close": pd.to_numeric(raw[close_col], errors="coerce") if close_col else 0,
+    })
+    if amt_col: df["Amount"] = pd.to_numeric(raw[amt_col], errors="coerce").fillna(0)
+    elif vol_col and close_col: df["Amount"] = pd.to_numeric(raw[vol_col], errors="coerce").fillna(0) * pd.to_numeric(raw[close_col], errors="coerce").fillna(0)
+    else: df["Amount"] = 0
+    # [추가] 업종/산업 — fdr.StockListing이 기본 제공하는 컬럼이라 별도 API 호출 없이 그대로 실음
+    df["Sector"] = raw[sector_col].astype(str) if sector_col else ""
+    df["Industry"] = raw[industry_col].astype(str) if industry_col else ""
+    return df
 
 def build_search_universe() -> pd.DataFrame:
     """
