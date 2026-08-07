@@ -253,26 +253,6 @@ def get_quant_dashboard(refresh: str = "false"):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 
-@app.get("/api/krx-list")
-@cached(cache=krx_cache)
-def get_krx_list(refresh: str = "false"):
-    iif refresh.lower() == "true":
-        krx_cache.clear()
-    try:
-        df = build_search_universe()
-        records = [
-            {
-                "Symbol": row["Symbol"],
-                "Name": row["Name"],
-                "Market": row.get("Market", "-"),
-                "SearchStr": f'{row["Name"]} ({row["Symbol"]})',
-            }
-            for _, row in df.iterrows()
-        ]
-        return {"status": "success", "data": records}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
 def build_search_universe() -> pd.DataFrame:
     """
     검색 드롭다운(/api/krx-list) 전용 전체 종목 리스트.
@@ -291,6 +271,27 @@ def build_search_universe() -> pd.DataFrame:
     common = raw_df[~mask_name & ~mask_preferred].copy()
 
     return common.reset_index(drop=True)
+
+
+@app.get("/api/krx-list")
+@cached(cache=krx_cache)
+def get_krx_list(refresh: str = "false"):
+    if refresh.lower() == "true":
+        krx_cache.clear()
+    try:
+        df = build_search_universe()
+        records = [
+            {
+                "Symbol": row["Symbol"],
+                "Name": row["Name"],
+                "Market": row.get("Market", "-"),
+                "SearchStr": f'{row["Name"]} ({row["Symbol"]})',
+            }
+            for _, row in df.iterrows()
+        ]
+        return {"status": "success", "data": records}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # ==============================================================================
 # ⚡ 4. 실시간 개별 종목/지수 분석 리포트 API 
