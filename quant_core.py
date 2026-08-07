@@ -433,6 +433,22 @@ def load_fundamental_from_db(supabase, symbol: str) -> dict | None:
     except: pass
     return None
 
+def load_fundamental_raw(supabase, symbol: str) -> dict | None:
+    """
+    TTL(90일) 체크 없이 캐시된 펀더멘털을 그대로 반환한다.
+    load_fundamental_from_db()는 90일 롤링 TTL로만 신선도를 판단하는데,
+    스크리너는 "분기 법정공시기한이 지났는가"라는 더 정확한 기준으로 판단해야 하므로
+    여기서는 만료 여부를 따지지 않고 원본 + updated_at만 그대로 돌려준다.
+    실제 신선도 판정은 호출부(quant_cron._needs_fundamental_refresh)가 한다.
+    """
+    try:
+        res = supabase.table(TBL_FUNDA).select("*").eq("symbol", symbol).execute()
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    return None
+
 def save_fundamental_to_db(supabase, symbol: str, name: str, data: dict):
     payload = {
         "symbol": symbol, "name": name,
@@ -885,21 +901,20 @@ def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float 
     today_vol  = df["Volume"].iloc[-1]
     breakout_threshold = metrics["high_60d"] * 0.90
 
-    # 2. 6관문(Gates) 조건 판정 (numpy 자료형 이슈를 막기 위해 파이썬 내장 bool()로 캐스팅)
-    f_growth = bool(metrics["growth_composite"] > 0)
-    f_mdd    = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
-    f_liq    = bool(metrics["liquidity_20d"] >= 50)
-    f_trend  = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
-               and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+    # 2. 6관문(Gates) 조건 판정 (배치 엔진과 완벽히 동일)
+    f_growth = metrics["growth_composite"] > 0
+    f_mdd    = metrics["mdd"] >= metrics["dynamic_mdd_limit"]
+    f_liq    = metrics["liquidity_20d"] >= 50
+    f_trend  = (curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
+               and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100))
 
-    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
-    f_break_strong_day1 = bool((curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
-    f_break = bool(f_break_confirmed or f_break_strong_day1)
+    f_break_confirmed = (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold)
+    f_break_strong_day1 = (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT))
+    f_break = f_break_confirmed or f_break_strong_day1
 
-    f_vol = bool((metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
+    f_vol = (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT))
 
-    # 합계 역시 파이썬 내장 int()로 확실하게 캐스팅
-    pass_count = int(sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol]))
+    pass_count = sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol])
 
     # 0으로 나누는 오류 방지용 안전 장치
     high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
