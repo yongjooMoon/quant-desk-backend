@@ -27,7 +27,7 @@ from quant_core import (
     load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst,
     load_fundamental_from_db, save_fundamental_to_db,
     # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
-    evaluate_entry_gates, get_index_return_pct,
+    evaluate_entry_gates, get_index_return_pct, build_search_universe,
 )
 from real_estate import generate_excel_data
 
@@ -251,51 +251,6 @@ def get_quant_dashboard(refresh: str = "false"):
             quant_smart_cache.last_ts = latest_ts
         return {"status": "success", "data": data, "cached": False}
     except Exception as e: return {"status": "error", "message": str(e)}
-
-def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
-    col = raw.columns.tolist()
-    sym = next((c for c in ["Symbol", "Code", "Ticker"] if c in col), None)
-    name = next((c for c in ["Name", "종목명"] if c in col), None)
-    cap = next((c for c in ["Marcap", "시가총액"] if c in col), None)
-    close_col = next((c for c in ["Close", "종가"] if c in col), None)
-    vol_col = next((c for c in ["Volume", "거래량"] if c in col), None)
-    amt_col = next((c for c in ["Amount", "거래대금"] if c in col), None)
-    sector_col = next((c for c in ["Sector", "업종"] if c in col), None)
-    industry_col = next((c for c in ["Industry", "산업"] if c in col), None)
-
-    df = pd.DataFrame({
-        "Symbol": raw[sym].astype(str).str.zfill(6), "Name": raw[name].astype(str),
-        "Market": market,
-        "Marcap": pd.to_numeric(raw[cap], errors="coerce") if cap else 0,
-        "Close": pd.to_numeric(raw[close_col], errors="coerce") if close_col else 0,
-    })
-    if amt_col: df["Amount"] = pd.to_numeric(raw[amt_col], errors="coerce").fillna(0)
-    elif vol_col and close_col: df["Amount"] = pd.to_numeric(raw[vol_col], errors="coerce").fillna(0) * pd.to_numeric(raw[close_col], errors="coerce").fillna(0)
-    else: df["Amount"] = 0
-    # [추가] 업종/산업 — fdr.StockListing이 기본 제공하는 컬럼이라 별도 API 호출 없이 그대로 실음
-    df["Sector"] = raw[sector_col].astype(str) if sector_col else ""
-    df["Industry"] = raw[industry_col].astype(str) if industry_col else ""
-    return df
-
-def build_search_universe() -> pd.DataFrame:
-    """
-    검색 드롭다운(/api/krx-list) 전용 전체 종목 리스트.
-    quant_cron의 전략 유니버스(marcap_min_억/tvol_min_억로 걸러진 것)와는 완전히 별개다.
-    검색은 매매 후보가 아니라 "존재하는 모든 종목"을 찾는 기능이므로,
-    ETF/ETN/스팩/리츠/우선주만 제외하고 시총·거래대금 하한은 적용하지 않는다.
-    """
-    kospi = _normalize_listing(fdr.StockListing("KOSPI"), "KOSPI")
-    kosdaq = _normalize_listing(fdr.StockListing("KOSDAQ"), "KOSDAQ")
-    raw_df = pd.concat([kospi, kosdaq], ignore_index=True)
-    raw_df = raw_df[raw_df["Symbol"].str.len() == 6].dropna(subset=["Symbol", "Name"])
-
-    exclude_kw = ["ETF", "ETN", "스팩", "리츠", "REIT", "인프라", "선박"]
-    mask_name = raw_df["Name"].str.contains("|".join(exclude_kw), na=False)
-    mask_preferred = raw_df["Symbol"].str[-1] != "0"  # 우선주 제외 — 검색에서도 보통주만
-    common = raw_df[~mask_name & ~mask_preferred].copy()
-
-    return common.reset_index(drop=True)
-
 
 @app.get("/api/krx-list")
 @cached(cache=krx_cache)
