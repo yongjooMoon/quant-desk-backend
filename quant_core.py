@@ -44,6 +44,7 @@ TBL_FUNDA   = "stock_fundamental"
 TBL_SCREEN  = "quant_screening_cache"
 TBL_WATCH   = "quant_watchlist_cache"
 TBL_SECTOR  = "stock_sector"   # [추가] 업종 분류 캐시 — 포트폴리오 섹터 분산용
+TBL_FUNDA_HISTORY = "stock_fundamental_history"
 
 ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일봉부터 삭제)
 FUNDA_TTL_SEC  = 86400 * 90
@@ -558,6 +559,40 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
 
     return metrics
 
+def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vol: float) -> dict:
+    """6대 매수 관문(성장/MDD/유동성/추세/돌파/수급) 판정 — 이 시스템의 유일한 판정 로직.
+    run_screening_from_db, evaluate_entry_gates, quant_backTesting.strategy_filters가 전부 이걸 호출한다."""
+    f_growth = bool(metrics["growth_composite"] > 0)
+    f_mdd = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
+    f_liq = bool(metrics["liquidity_20d"] >= 50)
+    f_trend = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"])
+                    and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+
+    breakout_threshold = metrics["high_60d"] * 0.90
+    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
+    f_break_strong_day1 = bool((curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
+    f_break = f_break_confirmed or f_break_strong_day1
+
+    f_vol = bool((metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
+
+    pass_count = int(sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol]))
+    high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
+    vol_60d_val = metrics["vol_60d"] if metrics["vol_60d"] > 0 else 1
+
+    gates = {
+        "growth": {"pass": f_growth, "label": "Growth Composite", "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
+        "mdd":    {"pass": f_mdd,    "label": "Dynamic MDD",      "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
+        "liq":    {"pass": f_liq,    "label": "Liquidity",        "reason": f"{metrics['liquidity_20d']:.0f}억"},
+        "trend":  {"pass": f_trend,  "label": "Trend Alignment",  "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
+        "break":  {"pass": f_break,  "label": "Price Breakout",
+                    "reason": (f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1
+                               else f"고점대비 {(curr_price/high_60d_val)*100:.1f}% (2일 연속 돌파권)")},
+        "vol":    {"pass": f_vol,    "label": "Volume Surge",
+                    "reason": f"Vol {(metrics['vol_5d']/vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"},
+    }
+    return {"pass_count": pass_count, "gates": gates,
+            "f_growth": f_growth, "f_mdd": f_mdd, "f_liq": f_liq,
+            "f_trend": f_trend, "f_break": f_break, "f_vol": f_vol}
 # ══════════════════════════════════════════
 # [E] 분리된 스크리닝 엔진 (Survival Filter -> Score Ranking)
 # ══════════════════════════════════════════
@@ -588,22 +623,10 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
 
         # 절대 조건 6가지 (강력한 추격매수 로직)
         # [순위4] f_trend: 과열 캡을 ATR% 기반 동적 이격도로 적용 (dynamic_overext_limit_pct)
-        f_growth = metrics["growth_composite"] > 0
-        f_mdd    = metrics["mdd"] >= metrics["dynamic_mdd_limit"]
-        f_liq    = metrics["liquidity_20d"] >= 50
-        f_trend  = (curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
-                   and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100))
-
-        # [순위4] f_break: 이중 경로 — ①표준(2일 연속 돌파권) ②예외(1일차라도 거래량 폭발이면 즉시 인정)
-        # "진짜 강한 돌파는 1일차에 거래량이 터진다"는 점을 반영해 최고 진입가를 살려둔다.
-        f_break_confirmed = (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold)
-        f_break_strong_day1 = (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT))
-        f_break = f_break_confirmed or f_break_strong_day1
-
-        # [순위4] f_vol: 당일 서지 배수 1.2배(약함) → 1.5배로 상향, 5일평균 조건과 밸런스
-        f_vol = (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT))
-
-        pass_count = sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol])
+        g = evaluate_gates(metrics, curr_price, prev_price, today_vol)
+        pass_count = g["pass_count"]
+        f_growth, f_mdd, f_liq, f_trend, f_break, f_vol = g["f_growth"], g["f_mdd"], g["f_liq"], g["f_trend"], g[
+            "f_break"], g["f_vol"]
 
         if pass_count < watchlist_min:
             continue
@@ -649,12 +672,12 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
             "net_income_yoy": net_yoy,
             "rs_60d": round(metrics.get("rs_60d", 0.0), 2),
             "filter_details": {
-                "Growth Composite": {"pass": f_growth, "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
-                "Dynamic MDD": {"pass": f_mdd, "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
-                "Liquidity": {"pass": f_liq, "reason": f"{metrics['liquidity_20d']:.0f}억"},
-                "Trend Alignment": {"pass": f_trend, "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
-                "Price Breakout": {"pass": f_break, "reason": ("1일차 강한돌파(Vol≥60d×{:.1f})".format(STRONG_BREAKOUT_VOL_MULT) if f_break_strong_day1 else f"고점대비 {(curr_price/metrics['high_60d'])*100:.1f}% (2일 연속 돌파권)")},
-                "Volume Surge": {"pass": f_vol, "reason": f"Vol {(metrics['vol_5d']/metrics['vol_60d']):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"}
+                "Growth Composite": {"pass": f_growth, "reason": g["gates"]["growth"]["reason"]},
+                "Dynamic MDD": {"pass": f_mdd, "reason": g["gates"]["mdd"]["reason"]},
+                "Liquidity": {"pass": f_liq, "reason": g["gates"]["liq"]["reason"]},
+                "Trend Alignment": {"pass": f_trend, "reason": g["gates"]["trend"]["reason"]},
+                "Price Breakout": {"pass": f_break, "reason": g["gates"]["break"]["reason"]},
+                "Volume Surge": {"pass": f_vol, "reason": g["gates"]["vol"]["reason"]}
             }
         })
 
@@ -883,82 +906,96 @@ def is_sector_concentrated(candidate_symbol: str, sector_map: dict, holding_symb
     return False, None
 
 def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0) -> dict:
-    """
-    단일 종목에 대해 실시간 추격매수 6관문(Gates) 통과 여부를 판정합니다.
-    (배치 모듈의 run_screening_from_db와 100% 동일한 로직과 파라미터를 사용)
-    UI의 실시간 검색(Search) 리포트에서 사용됩니다.
-    """
+    """단일 종목 실시간 6관문 판정 (UI 검색용) — evaluate_gates()로 위임."""
     if df.empty or len(df) < 60:
         return None
-
-    # 1. 퀀트 지표 산출
     metrics = calc_quant_metrics(df, fund, benchmark_ret_60d=benchmark_ret_60d)
     if "ma20" not in metrics or metrics["ma20"] == 0:
         return None
 
     curr_price = int(df["Close"].iloc[-1])
     prev_price = int(df["Close"].iloc[-2]) if len(df) >= 2 else curr_price
-    today_vol  = df["Volume"].iloc[-1]
-    breakout_threshold = metrics["high_60d"] * 0.90
+    today_vol = df["Volume"].iloc[-1]
 
-    # 2. 6관문(Gates) 조건 판정 (numpy 자료형 이슈를 막기 위해 파이썬 내장 bool()로 캐스팅)
-    f_growth = bool(metrics["growth_composite"] > 0)
-    f_mdd = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
-    f_liq = bool(metrics["liquidity_20d"] >= 50)
-    f_trend = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"]) \
-                   and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+    g = evaluate_gates(metrics, curr_price, prev_price, today_vol)
+    key_to_letter = {"growth": "A", "mdd": "B", "liq": "C", "trend": "D", "break": "E", "vol": "F"}
+    gates = {key_to_letter[k]: {"name": v["label"], "pass": v["pass"], "reason": v["reason"]}
+              for k, v in g["gates"].items()}
 
-    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
-    f_break_strong_day1 = bool(
-        (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
-    f_break = bool(f_break_confirmed or f_break_strong_day1)
+    return {"pass_count": g["pass_count"], "gates": gates, "metrics": metrics}
 
-    f_vol = bool(
-        (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
+def backfill_fundamental_history(symbol: str, name: str, corp_code: str, dart_api_key: str, years: list) -> list:
+    """DART API를 호출해서 과거 연도별 재무제표를 point-in-time 스냅샷 형태로 '조회'만 한다.
+    DB에 쓰지 않는다 — 저장은 save_fundamental_history()가 담당."""
+    rows = []
+    targets = [("11011", lambda y: f"{y+1}-03-31"), ("11012", lambda y: f"{y}-08-14")]
+    for year in years:
+        for reprt_code, known_from_fn in targets:
+            try:
+                res = requests.get(
+                    "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
+                    params={"crtfc_key": dart_api_key, "corp_code": corp_code,
+                            "bsns_year": str(year), "reprt_code": reprt_code, "fs_div": "CFS"},
+                    timeout=10,
+                ).json()
+            except Exception:
+                continue
+            if res.get("status") != "000":
+                continue
+            snap = {"op_profit": None, "net_income": None, "revenue": None, "roe": None, "debt_ratio": None}
+            for item in res.get("list", []):
+                acnt, val_raw = item.get("account_nm", ""), _parse_num(item.get("thstrm_amount", "0"))
+                val_억 = (val_raw / 1e8) if val_raw is not None else None
+                if "영업이익" in acnt and "영업이익률" not in acnt and snap["op_profit"] is None: snap["op_profit"] = val_억
+                if "당기순이익" in acnt and snap["net_income"] is None: snap["net_income"] = val_억
+                if "매출액" in acnt and snap["revenue"] is None: snap["revenue"] = val_억
+                if "ROE" in acnt and snap["roe"] is None: snap["roe"] = val_raw
+                if "부채비율" in acnt and snap["debt_ratio"] is None: snap["debt_ratio"] = val_raw
+            rows.append({"symbol": symbol, "name": name, "bsns_year": year, "reprt_code": reprt_code,
+                         "known_from": known_from_fn(year), "updated_at": now_kst_str(), **snap})
+    return rows
 
-    # 합계 역시 파이썬 내장 int()로 확실하게 캐스팅
-    pass_count = int(sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol]))
+def save_fundamental_history(supabase, rows: list):
+    """stock_fundamental_history 테이블에 실제로 저장(UPSERT)하는 함수. 여기서만 DB에 쓴다."""
+    if rows:
+        supabase.table(TBL_FUNDA_HISTORY).upsert(rows, on_conflict="symbol,bsns_year,reprt_code").execute()
 
-    # 0으로 나누는 오류 방지용 안전 장치
-    high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
-    vol_60d_val = metrics["vol_60d"] if metrics["vol_60d"] > 0 else 1
+def load_fundamental_history(supabase, symbol: str) -> list:
+    """DB에 이미 저장된 스냅샷을 그대로 조회. 이게 비어있어야 DART 호출이 발생한다."""
+    try:
+        res = supabase.table(TBL_FUNDA_HISTORY).select("*").eq("symbol", symbol).execute()
+        return res.data or []
+    except Exception:
+        return []
 
-    # 3. 프론트엔드 포맷 (A~F) 맵핑
-    gates = {
-        "A": {
-            "name": "Growth Composite",
-            "pass": f_growth,
-            "reason": f"Comp {metrics['growth_composite']:+.1f}%"
-        },
-        "B": {
-            "name": "Dynamic MDD",
-            "pass": f_mdd,
-            "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"
-        },
-        "C": {
-            "name": "Liquidity",
-            "pass": f_liq,
-            "reason": f"{metrics['liquidity_20d']:.0f}억"
-        },
-        "D": {
-            "name": "Trend Alignment",
-            "pass": f_trend,
-            "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"
-        },
-        "E": {
-            "name": "Price Breakout",
-            "pass": f_break,
-            "reason": f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1 else f"고점대비 {(curr_price/high_60d_val)*100:.1f}% (2일 연속 돌파권)"
-        },
-        "F": {
-            "name": "Volume Surge",
-            "pass": f_vol,
-            "reason": f"Vol {(metrics['vol_5d']/vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"
-        }
-    }
+def get_fundamental_history_cached(supabase, symbol: str, name: str, corp_code: str,
+                                    dart_api_key: str, years: list) -> list:
+    """캐시(DB)에 없는 연도만 DART로 채우고 저장한 뒤 반환. 이미 있는 연도는 DART를 다시 안 부른다."""
+    history = load_fundamental_history(supabase, symbol)                       # ① DB 조회
+    have_years = {h["bsns_year"] for h in history if h.get("reprt_code") == "11011"}
+    missing_years = [y for y in years if y not in have_years]
+    if missing_years and corp_code:
+        new_rows = backfill_fundamental_history(symbol, name, corp_code, dart_api_key, missing_years)  # ② DART 조회
+        if new_rows:
+            save_fundamental_history(supabase, new_rows)                       # ③ DB 저장 ← 실제 INSERT
+            history.extend(new_rows)
+    return history
 
+def build_asof_fund_dict(history: list, asof_date) -> dict:
+    """asof_date 시점에 이미 공시되어 있었을 연간 실적만으로 cur/prev 매핑.
+    ⚠️ 수급(foreign/institute_net_buy)은 과거 재현 불가 → 0으로 중립화."""
+    asof_str = asof_date.strftime("%Y-%m-%d") if hasattr(asof_date, "strftime") else str(asof_date)
+    annuals = sorted(
+        [h for h in history if h.get("reprt_code") == "11011" and h.get("known_from", "9999-99-99") <= asof_str],
+        key=lambda h: h["bsns_year"]
+    )
+    if not annuals:
+        return {}
+    cur = annuals[-1]
+    prev = annuals[-2] if len(annuals) >= 2 else {}
     return {
-        "pass_count": pass_count,
-        "gates": gates,
-        "metrics": metrics
+        "net_income_cur": cur.get("net_income"), "net_income_prev": prev.get("net_income"),
+        "op_profit_cur": cur.get("op_profit"), "op_profit_prev": prev.get("op_profit"),
+        "revenue_cur": cur.get("revenue"), "revenue_prev": prev.get("revenue"),
+        "foreign_net_buy": 0, "institute_net_buy": 0,
     }
