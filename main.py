@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import threading
 import urllib.request
 import urllib.parse
@@ -604,11 +605,6 @@ def get_backtesting_result(refresh: str = "false"):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-SCREENER_CACHE_TTL = 3600  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
-screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
-
-# 계산에 필요한 최소 과거 데이터 기간(일). 200일선 + RS 12개월(~252거래일) + 여유분.
-# 주말/공휴일 감안해서 넉넉히 380일(달력 기준)로 잡음.
 MINERVINI_LOOKBACK_DAYS = 380
  
 # 🌟 5분 -> 재무 조인 + pandas 연산이 붙어서 기존보다 무거워졌으므로 필요시 TTL을
@@ -617,13 +613,41 @@ MINERVINI_LOOKBACK_DAYS = 380
 SCREENER_CACHE_TTL = 3600
 screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
  
+# 🌟 그래도 ConnectionTerminated가 계속 나면 supabase 클라이언트 생성부(create_client)에서
+#    타임아웃을 늘려보세요. 기본 httpx 타임아웃이 짧아서 대량 페이지네이션 도중 끊길 수 있음:
+#
+#   from supabase.lib.client_options import ClientOptions
+#   supabase = create_client(
+#       url, key,
+#       options=ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
+#   )
  
-def fetch_all_rows(query_builder, page_size: int = 1000):
-    """Supabase REST 기본 응답 제한(1000행)을 넘는 조회를 위한 페이지네이션 헬퍼."""
+ 
+def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
+    """Supabase REST 기본 응답 제한(1000행)을 넘는 조회를 위한 페이지네이션 헬퍼.
+ 
+    🌟 ConnectionTerminated 대응:
+    stock_daily처럼 총 요청 횟수가 많아지는 쿼리는 그중 한 번만 네트워크가
+    끊겨도 전체가 실패한다. page 단위로 재시도(지수 백오프 + 지터)를 넣어서
+    일시적 커넥션 종료/타임아웃에 견디도록 함. query_builder는 매 페이지마다
+    새로 .range()를 호출해서 재사용하므로, 원본 쿼리 자체(select/eq/gte 등)는
+    재시도 시에도 그대로 유지됨 — supabase-py의 QueryBuilder는 .range()를
+    호출해도 원본이 변형되지 않고 새 요청 객체를 반환하므로 안전.
+    """
     all_rows = []
     start = 0
     while True:
-        res = query_builder.range(start, start + page_size - 1).execute()
+        attempt = 0
+        while True:
+            try:
+                res = query_builder.range(start, start + page_size - 1).execute()
+                break
+            except Exception:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                # 지수 백오프 + 지터: 0.4s, 0.8s, 1.6s, 3.2s (+ 임의 지연)
+                time.sleep((0.4 * (2 ** (attempt - 1))) + random.uniform(0, 0.3))
         rows = res.data or []
         all_rows.extend(rows)
         if len(rows) < page_size:
@@ -798,14 +822,26 @@ def get_screener_data(refresh: str = "false"):
         sector_rows = fetch_all_rows(supabase.table("stock_sector").select("symbol,sector"))
         sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
  
-        # 3) 일별 종가 — 미네르비니 계산에 필요한 최소 기간만 조회
+        # 3) 일별 종가 — 미네르비니 계산에 필요한 최소 기간만, 그리고
+        #    재무 데이터가 있는(=스크리너 대상이 될 수 있는) 종목으로만 조회.
+        #    ⚠️ 전체 stock_daily를 다 긁으면 종목수 x 380일 만큼 페이지가 생겨
+        #    ConnectionTerminated처럼 중간에 끊기기 쉬움 — symbol 필터로 요청량 자체를 줄임.
+        target_symbols = list(fund_by_symbol.keys())
         cutoff = (datetime.utcnow() - timedelta(days=MINERVINI_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-        daily_rows = fetch_all_rows(
-            supabase.table("stock_daily")
-            .select("symbol,date,close")
-            .gte("date", cutoff)
-            .order("date", desc=False)
-        )
+ 
+        daily_rows = []
+        SYMBOL_BATCH = 200  # .in_() URL 길이 제한을 피하기 위해 심볼을 나눠서 조회
+        for i in range(0, len(target_symbols), SYMBOL_BATCH):
+            batch = target_symbols[i:i + SYMBOL_BATCH]
+            batch_rows = fetch_all_rows(
+                supabase.table("stock_daily")
+                .select("symbol,date,close")
+                .in_("symbol", batch)
+                .gte("date", cutoff)
+                .order("date", desc=False)
+            )
+            daily_rows.extend(batch_rows)
+ 
         if not daily_rows:
             return {"status": "error", "message": "stock_daily 데이터가 없습니다"}
  
