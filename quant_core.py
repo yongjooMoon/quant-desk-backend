@@ -19,6 +19,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
+from datetime import date  # 파일 상단 import에 없으면 추가
 
 # ──────────────────────────────────────────
 # 공통 유틸
@@ -45,6 +46,9 @@ TBL_SCREEN  = "quant_screening_cache"
 TBL_WATCH   = "quant_watchlist_cache"
 TBL_SECTOR  = "stock_sector"   # [추가] 업종 분류 캐시 — 포트폴리오 섹터 분산용
 TBL_FUNDA_HISTORY = "stock_fundamental_history"
+TBL_FUNDA_QUARTERLY = "stock_fundamental_quarterly"
+QUARTER_REPRT_CODES = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
+QUARTERLY_ROUTINE_LOOKBACK = 2   # 매주 확인할 분기 개수 (최신 + 버퍼 1개)
 
 ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일봉부터 삭제)
 FUNDA_TTL_SEC  = 86400 * 90
@@ -55,6 +59,12 @@ PREFILTER_TVOL_억   = 50
 CONFIRM_FILTER_MIN  = 6     # 6개 강력한 추격매수 조건 ALL PASS
 WATCHLIST_FILTER_MIN= 4     # 최소 4개 이상 통과시 관심종목
 
+DART_ACCOUNT_ID_MAP = {
+    "revenue":   ["ifrs-full_Revenue", "ifrs_Revenue", "dart_Revenue"],
+    "op_profit": ["dart_OperatingIncomeLoss", "ifrs-full_OperatingIncomeLoss"],
+    "net_income": ["ifrs-full_ProfitLoss"],  # 지배/비지배 합산 총 당기순이익
+    "eps":       ["ifrs-full_BasicEarningsLossPerShare"],
+}
 # ══════════════════════════════════════════
 # [규모 1] 시장 레짐(국면) 파라미터
 # ══════════════════════════════════════════
@@ -331,19 +341,26 @@ def _parse_num(txt) -> float | None:
 def fetch_dart_financial(corp_code: str, dart_api_key: str, year: int = None) -> dict:
     if year is None: year = now_kst().year - 1
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-    result = {"roe": None, "debt_ratio": None, "op_profit": None, "net_income": None, "revenue": None, "eps": None}
+    result = {"roe": None, "debt_ratio": None, "op_profit": None, "net_income": None,
+              "revenue": None, "eps": None, "period_type": None}  # ← 추가: 어떤 걸로 채웠는지 표시
     for reprt_code in ["11011", "11012"]:
         try:
             res = requests.get(url, params={"crtfc_key": dart_api_key, "corp_code": corp_code, "bsns_year": str(year), "reprt_code": reprt_code, "fs_div": "CFS"}, timeout=10).json()
             if res.get("status") != "000": continue
             for item in res.get("list", []):
-                acnt, val_raw = item.get("account_nm", ""), _parse_num(item.get("thstrm_amount", "0"))
+                acnt = item.get("account_nm", "")
+                val_raw = _parse_num(item.get("thstrm_amount", "0"))
+                if val_raw is None:
+                    continue
                 val_억 = val_raw / 1e8
                 if "영업이익" in acnt and "영업이익률" not in acnt and result["op_profit"] is None: result["op_profit"] = val_억
                 if "당기순이익" in acnt and result["net_income"] is None: result["net_income"] = val_억
                 if "매출액" in acnt and result["revenue"] is None: result["revenue"] = val_억
                 if "ROE" in acnt and result["roe"] is None: result["roe"] = val_raw
                 if "부채비율" in acnt and result["debt_ratio"] is None: result["debt_ratio"] = val_raw
+                if "주당순이익" in acnt and "희석" not in acnt and result["eps"] is None:
+                    result["eps"] = val_raw
+            result["period_type"] = "annual" if reprt_code == "11011" else "half_year"  # ← 추가
             break
         except: pass
     return result
@@ -483,11 +500,22 @@ def get_fundamental(supabase, symbol: str, name: str, dart_api_key: str = "", da
     data = {}
     if dart_api_key and dart_corp_map and dart_corp_map.get(symbol):
         c_code = dart_corp_map.get(symbol)
-        cur, prev = fetch_dart_financial(c_code, dart_api_key, now_kst().year - 1), fetch_dart_financial(c_code, dart_api_key, now_kst().year - 2)
-        data.update({"op_profit_cur": cur.get("op_profit"), "op_profit_prev": prev.get("op_profit"),
-                     "net_income_cur": cur.get("net_income"), "net_income_prev": prev.get("net_income"),
-                     "revenue_cur": cur.get("revenue"), "revenue_prev": prev.get("revenue"),
-                     "roe": cur.get("roe"), "debt_ratio": cur.get("debt_ratio")})
+        cur = fetch_dart_financial(c_code, dart_api_key, now_kst().year - 1)
+        prev = fetch_dart_financial(c_code, dart_api_key, now_kst().year - 2)
+
+        # [추가] 기간 단위가 다르면(연간 vs 반기) 신뢰 불가 → 통째로 버리고 네이버 폴백에 맡김
+        period_mismatch = (
+            cur.get("period_type") and prev.get("period_type")
+            and cur["period_type"] != prev["period_type"]
+        )
+        if period_mismatch:
+            print(f"  [!] {symbol} DART 기간 불일치 (cur={cur['period_type']}, prev={prev['period_type']}) → 이번 값은 폐기, 네이버로 폴백")
+        else:
+            data.update({"op_profit_cur": cur.get("op_profit"), "op_profit_prev": prev.get("op_profit"),
+                         "net_income_cur": cur.get("net_income"), "net_income_prev": prev.get("net_income"),
+                         "revenue_cur": cur.get("revenue"), "revenue_prev": prev.get("revenue"),
+                         "roe": cur.get("roe"), "debt_ratio": cur.get("debt_ratio"),
+                         "eps_cur": cur.get("eps"), "eps_prev": prev.get("eps")})
 
     naver = fetch_naver_fundamental(symbol)
     for k, v in naver.items():
@@ -999,3 +1027,227 @@ def build_asof_fund_dict(history: list, asof_date) -> dict:
         "revenue_cur": cur.get("revenue"), "revenue_prev": prev.get("revenue"),
         "foreign_net_buy": 0, "institute_net_buy": 0,
     }
+
+def _quarter_deadline(year: int, quarter: int) -> date:
+    """분기별 법정공시기한(근사). 4분기(사업보고서)는 마감이 '다음해' 3/31."""
+    if quarter == 1: return date(year, 5, 15)
+    if quarter == 2: return date(year, 8, 14)
+    if quarter == 3: return date(year, 11, 14)
+    return date(year + 1, 3, 31)
+
+
+def latest_confirmed_quarter(asof: date = None) -> tuple:
+    """asof 기준 이미 법정기한이 지나서 '존재할 수 있는' 가장 최근 (year, quarter)."""
+    asof = asof or now_kst().date()
+    y = asof.year
+    for q in [4, 3, 2, 1]:
+        year = y - 1 if q == 4 else y
+        if _quarter_deadline(year, q) <= asof:
+            return (year, q)
+    return (y - 1, 4)
+
+def backfill_quarterly_fundamental(supabase, universe_df: pd.DataFrame, dart_api_key: str,
+                                    dart_corp_map: dict, lookback_quarters: int = QUARTERLY_ROUTINE_LOOKBACK,
+                                    log_fn=print) -> int:
+    """
+    종목마다: ① DB에 이미 있는 분기 조회 → ② 없는 분기만 DART 호출 → ③ 있으면 insert, 없으면 넘어감.
+    DART 실패/API 소진 시 그냥 pass하고 다음 종목으로 진행 (다음 배치에서 자동 재시도됨).
+    """
+    latest_y, latest_q = latest_confirmed_quarter()
+    target_quarters = []
+    y, q = latest_y, latest_q
+    for _ in range(lookback_quarters):
+        target_quarters.append((y, q))
+        q -= 1
+        if q == 0:
+            q, y = 4, y - 1
+
+    total, filled, skipped, no_corp = len(universe_df), 0, 0, 0
+    for i, (_, row) in enumerate(universe_df.iterrows()):
+        symbol, name = row["Symbol"], row.get("Name", row["Symbol"])
+        corp_code = dart_corp_map.get(symbol)
+        if not corp_code:
+            no_corp += 1
+            continue
+
+        # ① DB 먼저 조회
+        try:
+            existing = supabase.table(TBL_FUNDA_QUARTERLY).select("bsns_year,quarter") \
+                .eq("symbol", symbol).execute()
+            have = {(r["bsns_year"], r["quarter"]) for r in existing.data}
+        except Exception:
+            have = set()
+
+        missing = [(yy, qq) for (yy, qq) in target_quarters if (yy, qq) not in have]
+        if not missing:
+            skipped += 1
+            continue
+
+        # ② 없는 분기만 DART 호출
+        rows_to_upsert = []
+        for (yy, qq) in missing:
+            try:
+                vals = _quarter_standalone(corp_code, dart_api_key, yy, qq)
+            except Exception:
+                continue  # API 소진/오류 → 이 분기만 pass, 다음 배치에서 재시도
+            if not vals:
+                continue
+            rows_to_upsert.append({
+                "symbol": symbol, "name": name, "bsns_year": yy, "quarter": qq,
+                "reprt_code": QUARTER_REPRT_CODES[qq],
+                "revenue_q": vals.get("revenue"), "op_profit_q": vals.get("op_profit"),
+                "net_income_q": vals.get("net_income"), "eps_q": vals.get("eps"),
+                "roe": vals.get("roe"), "debt_ratio": vals.get("debt_ratio"),
+                "current_ratio": vals.get("current_ratio"), "interest_coverage": vals.get("interest_coverage"),
+                "known_from": _quarter_deadline(yy, qq).strftime("%Y-%m-%d"),
+                "updated_at": now_kst_str(),
+            })
+
+        # ③ 있으면 insert, 없으면 그냥 다음 종목으로
+        if rows_to_upsert:
+            try:
+                supabase.table(TBL_FUNDA_QUARTERLY).upsert(
+                    rows_to_upsert, on_conflict="symbol,bsns_year,quarter"
+                ).execute()
+                filled += len(rows_to_upsert)
+            except Exception as e:
+                log_fn(f"    [!] {name}({symbol}) 저장 실패: {e}")
+
+        if (i + 1) % 200 == 0 or (i + 1) == total:
+            log_fn(f"    [{i+1}/{total}] 처리중... (신규 {filled}건, 이미최신 스킵 {skipped}종목, corp_code없음 {no_corp}종목)")
+
+    log_fn(f"  [✓] 분기 펀더멘털 백필 완료 — 신규 {filled}건 / 이미최신 {skipped}종목 / corp_code없음 {no_corp}종목")
+    return filled
+
+
+def _parse_dart_accounts(item_list: list) -> dict:
+    """
+    DART fnlttSinglAcntAll의 list 원본을 표준 필드(revenue/op_profit/net_income/eps)로 변환.
+    1순위: account_id(XBRL 표준 태그) 매칭 — 라벨 변형에 흔들리지 않음
+    2순위: account_nm 텍스트 매칭 — account_id가 없는 구버전 공시 대비 폴백
+    3곳(fetch_dart_financial / backfill_fundamental_history / _dart_quarter_report)에
+    흩어져 있던 동일 로직을 이 함수 하나로 통합 — 앞으로는 여기만 고치면 됨.
+    """
+    out = {"revenue": None, "op_profit": None, "net_income": None, "eps": None}
+
+    # 1순위: account_id
+    for item in item_list:
+        acc_id = item.get("account_id", "")
+        val_raw = _parse_num(item.get("thstrm_amount", "0"))
+        if val_raw is None or not acc_id:
+            continue
+        for field, id_candidates in DART_ACCOUNT_ID_MAP.items():
+            if out[field] is not None:
+                continue
+            if acc_id in id_candidates:
+                out[field] = val_raw if field == "eps" else val_raw / 1e8
+
+    # 2순위: 텍스트 폴백 (account_id로 못 채운 필드만)
+    for item in item_list:
+        acnt = item.get("account_nm", "")
+        val_raw = _parse_num(item.get("thstrm_amount", "0"))
+        if val_raw is None:
+            continue
+        if out["op_profit"] is None and "영업이익" in acnt and "영업이익률" not in acnt:
+            out["op_profit"] = val_raw / 1e8
+        if out["net_income"] is None and ("당기순이익" in acnt or "반기순이익" in acnt or "분기순이익" in acnt):
+            out["net_income"] = val_raw / 1e8
+        if out["revenue"] is None and ("매출액" in acnt or acnt.strip() == "수익(매출액)"):
+            out["revenue"] = val_raw / 1e8
+        if out["eps"] is None and "주당순이익" in acnt and "희석" not in acnt:
+            out["eps"] = val_raw
+
+    return out
+
+
+def _dart_quarter_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str) -> dict:
+    """
+    DART 재무제표(fnlttSinglAcntAll) 조회.
+    [수정 1] CFS 실패/빈값 시 OFS(개별재무제표)로 폴백 — 연결재무제표 미제출 기업 데이터 누락 방지
+    [수정 2] account_id 우선 매칭으로 교체 (_parse_dart_accounts)
+    [수정 3] ROE/부채비율/유동비율/이자보상배율 스캔 로직 완전 제거
+             → 이 API에는 애초에 존재하지 않는 필드였음 (재무비율은 _dart_index_report가 담당)
+    """
+    result = {"revenue": None, "op_profit": None, "net_income": None, "eps": None}
+    for fs_div in ("CFS", "OFS"):
+        try:
+            res = requests.get(
+                "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
+                params={"crtfc_key": dart_api_key, "corp_code": corp_code,
+                        "bsns_year": str(year), "reprt_code": reprt_code, "fs_div": fs_div},
+                timeout=10,
+            ).json()
+        except Exception:
+            continue
+        if res.get("status") != "000" or not res.get("list"):
+            continue
+        result = _parse_dart_accounts(res["list"])
+        if any(v is not None for v in result.values()):
+            break  # CFS에서 뭐라도 건졌으면 OFS까지 안 감. CFS가 비었을 때만 OFS 시도
+    return result
+
+
+def _dart_index_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str) -> dict:
+    """
+    ROE/부채비율/유동비율/이자보상배율 조회.
+    [확인됨] debt_ratio="부채비율", current_ratio="유동비율" 라벨 매칭 정상 동작 중.
+    [수정] roe 라벨이 "자기자본순이익률"이 아니라 그냥 "ROE"임 — 실측 확인 완료.
+    [주의] interest_coverage는 이자비용이 미미한 우량기업(삼성전자 등)은
+           DART가 아예 계산하지 않고 None으로 옴 — 정상 동작, 코드 문제 아님.
+    """
+    ratios = {"roe": None, "debt_ratio": None, "current_ratio": None, "interest_coverage": None}
+    for idx_cl_code in ("M210000", "M220000"):
+        try:
+            res = requests.get(
+                "https://opendart.fss.or.kr/api/fnlttSinglIndx.json",
+                params={"crtfc_key": dart_api_key, "corp_code": corp_code,
+                        "bsns_year": str(year), "reprt_code": reprt_code,
+                        "idx_cl_code": idx_cl_code},
+                timeout=10,
+            ).json()
+            if res.get("status") != "000":
+                continue
+            for item in res.get("list", []):
+                nm = item.get("idx_nm", "").strip()
+                val = _parse_num(item.get("idx_val", ""))
+                if val is None:
+                    continue
+                if nm == "ROE" and ratios["roe"] is None:
+                    ratios["roe"] = val
+                elif nm == "부채비율" and ratios["debt_ratio"] is None:
+                    ratios["debt_ratio"] = val
+                elif nm == "유동비율" and ratios["current_ratio"] is None:
+                    ratios["current_ratio"] = val
+                elif nm in ("이자보상배율", "순이자보상배율") and ratios["interest_coverage"] is None:
+                    ratios["interest_coverage"] = val
+        except Exception:
+            pass
+    return ratios
+
+
+def _quarter_standalone(corp_code: str, dart_api_key: str, year: int, quarter: int) -> dict:
+    """
+    분기 단독값 = 해당분기 누적 - 직전분기 누적 (1분기는 그 자체가 단독값).
+    [수정] net_income 하나가 None이라고 EPS/revenue/op_profit까지 전부 버리던 게이트를 제거.
+           필드별로 독립적으로 살아남게 함 — "EPS만 왜 계속 안 채워지지" 현상의 직접 원인이었음.
+           완전히 빈 응답(4개 필드 다 None)일 때만 그 분기를 포기.
+    """
+    cur = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter])
+    if not any(v is not None for v in cur.values()):
+        return {}  # 진짜 아무 것도 못 가져온 경우만 포기
+
+    idx = _dart_index_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter])
+    out = {"roe": idx["roe"], "debt_ratio": idx["debt_ratio"],
+           "current_ratio": idx["current_ratio"], "interest_coverage": idx["interest_coverage"]}
+
+    if quarter == 1:
+        out.update({k: cur.get(k) for k in ["revenue", "op_profit", "net_income", "eps"]})
+        return out
+
+    prev = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter - 1])
+    for k in ["revenue", "op_profit", "net_income", "eps"]:
+        if cur.get(k) is not None and prev.get(k) is not None:
+            out[k] = cur[k] - prev[k]
+        else:
+            out[k] = None  # 이 필드만 결측, 나머지는 살아있으면 그대로 저장됨
+    return out
