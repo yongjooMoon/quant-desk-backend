@@ -615,7 +615,7 @@ def get_screener_data(refresh: str = "false"):
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        res = supabase.table("quant_screener_scores").select("*").execute()
+        res = supabase.table("stock_fundamental_quarterly").select("*").execute()
         return {"status": "success", "data": res.data or []}
     except Exception as e:
         return {"status": "error", "message": str(e)}
