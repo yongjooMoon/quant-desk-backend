@@ -2,6 +2,7 @@ import os
 import json
 import random
 import threading
+import time
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -605,35 +606,17 @@ def get_backtesting_result(refresh: str = "false"):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-MINERVINI_LOOKBACK_DAYS = 380
- 
-# 🌟 5분 -> 재무 조인 + pandas 연산이 붙어서 기존보다 무거워졌으므로 필요시 TTL을
-#    늘리는 걸 권장 (예: 하루 1회만 갱신해도 되는 데이터라면 6~24시간).
-#    일단 기존 값 유지, 프로젝트 기존 TTL 있으면 그걸로 맞추세요.
+
+# 🌟 배치가 하루 한 번(14:30)만 갱신하는 데이터이므로, 캐시 TTL을 그에 맞춰 넉넉히 잡아도 됨.
+#    프론트에서 새로고침 버튼 누르면 refresh=true로 캐시를 비우고 다시 읽음.
 SCREENER_CACHE_TTL = 3600
 screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
  
-# 🌟 그래도 ConnectionTerminated가 계속 나면 supabase 클라이언트 생성부(create_client)에서
-#    타임아웃을 늘려보세요. 기본 httpx 타임아웃이 짧아서 대량 페이지네이션 도중 끊길 수 있음:
-#
-#   from supabase.lib.client_options import ClientOptions
-#   supabase = create_client(
-#       url, key,
-#       options=ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
-#   )
- 
  
 def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
-    """Supabase REST 기본 응답 제한(1000행)을 넘는 조회를 위한 페이지네이션 헬퍼.
- 
-    🌟 ConnectionTerminated 대응:
-    stock_daily처럼 총 요청 횟수가 많아지는 쿼리는 그중 한 번만 네트워크가
-    끊겨도 전체가 실패한다. page 단위로 재시도(지수 백오프 + 지터)를 넣어서
-    일시적 커넥션 종료/타임아웃에 견디도록 함. query_builder는 매 페이지마다
-    새로 .range()를 호출해서 재사용하므로, 원본 쿼리 자체(select/eq/gte 등)는
-    재시도 시에도 그대로 유지됨 — supabase-py의 QueryBuilder는 .range()를
-    호출해도 원본이 변형되지 않고 새 요청 객체를 반환하므로 안전.
-    """
+    """Supabase REST 기본 1000행 제한 대응 페이지네이션 + 일시적 커넥션 종료 재시도.
+    stock_trend_stats/stock_sector/stock_fundamental_quarterly 모두 종목당 1행이라
+    이전(stock_daily 전체)보다 페이지 수 자체가 훨씬 적어져서 끊길 위험도 크게 줄어듦."""
     all_rows = []
     start = 0
     while True:
@@ -646,7 +629,6 @@ def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
                 attempt += 1
                 if attempt > max_retries:
                     raise
-                # 지수 백오프 + 지터: 0.4s, 0.8s, 1.6s, 3.2s (+ 임의 지연)
                 time.sleep((0.4 * (2 ** (attempt - 1))) + random.uniform(0, 0.3))
         rows = res.data or []
         all_rows.extend(rows)
@@ -654,142 +636,6 @@ def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
             break
         start += page_size
     return all_rows
- 
- 
-def _pass_ratio(checks) -> float:
-    """[True, False, ...] -> 통과 비율 * 100. 체크 항목이 하나도 유효하지 않으면 0."""
-    valid = [c for c in checks if c is not None]
-    if not valid:
-        return 0.0
-    return round(sum(1 for c in valid if c) / len(valid) * 100, 1)
- 
- 
-def compute_minervini_row(symbol: str, name: str, closes: pd.Series):
-    """closes: 날짜 오름차순 정렬된 종가 Series (해당 symbol만).
-       200일선 계산에 필요한 최소치를 못 채우면 None 반환(스크리너 대상에서 제외)."""
-    n = len(closes)
-    if n < 210:  # 200일선 + 최소 1개월(약 10거래일) 여유
-        return None
- 
-    ma50 = closes.rolling(50).mean()
-    ma150 = closes.rolling(150).mean()
-    ma200 = closes.rolling(200).mean()
- 
-    price = float(closes.iloc[-1])
-    ma50_now, ma150_now, ma200_now = ma50.iloc[-1], ma150.iloc[-1], ma200.iloc[-1]
-    if pd.isna(ma150_now) or pd.isna(ma200_now):
-        return None
- 
-    def _at(series, back):
-        idx = n - 1 - back
-        if idx < 0:
-            return None
-        v = series.iloc[idx]
-        return None if pd.isna(v) else v
- 
-    ma200_1m_ago = _at(ma200, 21)   # ~1개월 전
-    ma200_3m_ago = _at(ma200, 63)   # ~3개월 전
-    ma50_2w_ago = _at(ma50, 10)     # ~2주 전
- 
-    lookback = min(n, 252)
-    recent = closes.iloc[-lookback:]
-    w52_high = float(recent.max())
-    w52_low = float(recent.min())
- 
-    # --- 축 1: 정배열 (Trend Alignment) ---
-    checks_alignment = [
-        price > ma50_now if pd.notna(ma50_now) else None,
-        ma50_now > ma150_now if pd.notna(ma50_now) else None,
-        ma150_now > ma200_now,
-        price > ma200_now,
-    ]
-    trend_alignment_score = _pass_ratio(checks_alignment)
- 
-    # --- 축 2: 200일선 상승추세 ---
-    checks_ma200_trend = [
-        ma200_now > ma200_1m_ago if ma200_1m_ago is not None else None,
-        ma200_now > ma200_3m_ago if ma200_3m_ago is not None else None,
-    ]
-    ma200_trend_score = _pass_ratio(checks_ma200_trend)
- 
-    # --- 축 3: 52주 신고가 근접도 ---
-    pct_from_high = (w52_high - price) / w52_high * 100 if w52_high else None
-    checks_high = [
-        pct_from_high is not None and pct_from_high <= 25,
-        pct_from_high is not None and pct_from_high <= 10,
-    ]
-    high_proximity_score = _pass_ratio(checks_high)
- 
-    # --- 축 4: 52주 신저가 대비 상승 ---
-    pct_above_low = (price - w52_low) / w52_low * 100 if w52_low else None
-    checks_low = [
-        pct_above_low is not None and pct_above_low >= 30,
-        pct_above_low is not None and pct_above_low >= 50,
-    ]
-    low_rise_score = _pass_ratio(checks_low)
- 
-    # --- 축 6: 50일선 지지/모멘텀 ---
-    checks_ma50 = [
-        price > ma50_now if pd.notna(ma50_now) else None,
-        ma50_now > ma50_2w_ago if (pd.notna(ma50_now) and ma50_2w_ago is not None) else None,
-    ]
-    ma50_momentum_score = _pass_ratio(checks_ma50)
- 
-    # --- 축 5(RS)용 원자재: 3/6/9/12개월 수익률 → 유니버스 계산 끝난 뒤 백분위로 변환 ---
-    def _ret(back):
-        idx = n - 1 - back
-        if idx < 0 or closes.iloc[idx] == 0:
-            return None
-        return (price - closes.iloc[idx]) / closes.iloc[idx]
- 
-    ret_3m, ret_6m, ret_9m, ret_12m = _ret(63), _ret(126), _ret(189), _ret(252)
-    weights = [0.4, 0.2, 0.2, 0.2]  # IBD 스타일: 최근 구간에 더 큰 가중치
-    pairs = [(weights[0], ret_3m), (weights[1], ret_6m), (weights[2], ret_9m), (weights[3], ret_12m)]
-    valid_pairs = [(w, r) for w, r in pairs if r is not None]
-    raw_momentum = (sum(w * r for w, r in valid_pairs) / sum(w for w, _ in valid_pairs)) if valid_pairs else None
- 
-    ret_1m = _ret(21)
- 
-    return {
-        "symbol": symbol,
-        "name": name,
-        "current_price": round(price),
-        "ma50": round(ma50_now, 1) if pd.notna(ma50_now) else None,
-        "ma150": round(ma150_now, 1),
-        "ma200": round(ma200_now, 1),
-        "week52_high": round(w52_high),
-        "week52_low": round(w52_low),
-        "pct_from_52w_high": round(pct_from_high, 1) if pct_from_high is not None else None,
-        "pct_above_52w_low": round(pct_above_low, 1) if pct_above_low is not None else None,
-        "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
-        "trend_alignment_score": trend_alignment_score,
-        "ma200_trend_score": ma200_trend_score,
-        "high_proximity_score": high_proximity_score,
-        "low_rise_score": low_rise_score,
-        "ma50_momentum_score": ma50_momentum_score,
-        "_raw_momentum": raw_momentum,  # 임시 필드 — 아래 _attach_rs_percentile에서 rs_score로 치환 후 제거
-    }
- 
- 
-def _attach_rs_percentile(rows):
-    """유니버스 전체 대비 가격 모멘텀 백분위(1~99, IBD RS Rating 관례) 산출 +
-       6축 중 70점 이상 통과한 축 개수(entry_gate_pass_count) 계산."""
-    momentum_vals = sorted(r["_raw_momentum"] for r in rows if r["_raw_momentum"] is not None)
- 
-    for r in rows:
-        v = r.pop("_raw_momentum")
-        if v is not None and momentum_vals:
-            rank = sum(1 for x in momentum_vals if x <= v) / len(momentum_vals)
-            r["rs_score"] = round(max(1, min(99, rank * 99)))
-        else:
-            r["rs_score"] = None
- 
-        axis_scores = [
-            r["trend_alignment_score"], r["ma200_trend_score"], r["high_proximity_score"],
-            r["low_rise_score"], r["ma50_momentum_score"], r["rs_score"] or 0,
-        ]
-        r["entry_gate_pass_count"] = sum(1 for s in axis_scores if s is not None and s >= 70)
-    return rows
  
  
 @app.get("/api/screener")
@@ -800,66 +646,34 @@ def get_screener_data(refresh: str = "false"):
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        # 1) 최신 분기 재무 (symbol별 최신 1건만 사용 — 정렬 후 첫 값 채택)
+        # 1) 트렌드 지표 캐시 (배치가 매일 계산해둔 것 — 여기가 메인 데이터)
+        trend_rows = fetch_all_rows(supabase.table("stock_trend_stats").select("*"))
+        if not trend_rows:
+            return {"status": "error", "message": "stock_trend_stats가 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)"}
+ 
+        # 2) 섹터
+        sector_rows = fetch_all_rows(supabase.table("stock_sector").select("symbol,sector"))
+        sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
+ 
+        # 3) 최신 분기 재무 (symbol별 최신 1건만 채택)
         fundamentals = fetch_all_rows(
             supabase.table("stock_fundamental_quarterly")
-            .select("symbol,name,bsns_year,quarter,revenue_q,op_profit_q,net_income_q,"
+            .select("symbol,bsns_year,quarter,revenue_q,op_profit_q,net_income_q,"
                      "eps_q,roe,debt_ratio,current_ratio,interest_coverage")
             .order("bsns_year", desc=True)
             .order("quarter", desc=True)
         )
         fund_by_symbol = {}
         for row in fundamentals:
-            fund_by_symbol.setdefault(row["symbol"], row)  # 이미 최신 건이 있으면 skip
- 
-        # 2) 섹터 조인
-        #    ⚠️ stock_sector에 symbol 컬럼과 FK 관계(예: stock_fundamental_quarterly.symbol
-        #    -> stock_sector.symbol)가 잡혀 있다면, 별도 쿼리 대신 PostgREST 임베딩으로
-        #    한 번에 가져올 수도 있습니다:
-        #      supabase.table("stock_fundamental_quarterly")
-        #        .select("*, stock_sector(sector)")
-        #    다만 여기서는 FK 여부를 확신할 수 없어 안전하게 별도 조회 후 파이썬에서 merge.
-        sector_rows = fetch_all_rows(supabase.table("stock_sector").select("symbol,sector"))
-        sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
- 
-        # 3) 일별 종가 — 미네르비니 계산에 필요한 최소 기간만, 그리고
-        #    재무 데이터가 있는(=스크리너 대상이 될 수 있는) 종목으로만 조회.
-        #    ⚠️ 전체 stock_daily를 다 긁으면 종목수 x 380일 만큼 페이지가 생겨
-        #    ConnectionTerminated처럼 중간에 끊기기 쉬움 — symbol 필터로 요청량 자체를 줄임.
-        target_symbols = list(fund_by_symbol.keys())
-        cutoff = (datetime.utcnow() - timedelta(days=MINERVINI_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
- 
-        daily_rows = []
-        SYMBOL_BATCH = 200  # .in_() URL 길이 제한을 피하기 위해 심볼을 나눠서 조회
-        for i in range(0, len(target_symbols), SYMBOL_BATCH):
-            batch = target_symbols[i:i + SYMBOL_BATCH]
-            batch_rows = fetch_all_rows(
-                supabase.table("stock_daily")
-                .select("symbol,date,close")
-                .in_("symbol", batch)
-                .gte("date", cutoff)
-                .order("date", desc=False)
-            )
-            daily_rows.extend(batch_rows)
- 
-        if not daily_rows:
-            return {"status": "error", "message": "stock_daily 데이터가 없습니다"}
- 
-        daily_df = pd.DataFrame(daily_rows)
-        daily_df["close"] = pd.to_numeric(daily_df["close"], errors="coerce")
-        daily_df = daily_df.dropna(subset=["close"])
+            fund_by_symbol.setdefault(row["symbol"], row)
  
         results = []
-        for symbol, grp in daily_df.groupby("symbol"):
-            closes = grp.sort_values("date")["close"].reset_index(drop=True)
-            fund = fund_by_symbol.get(symbol, {})
-            name = fund.get("name") or symbol
- 
-            row = compute_minervini_row(symbol, name, closes)
-            if row is None:
-                continue  # 상장 200거래일 미만 등 계산 불가 종목은 스크리너 대상에서 제외
- 
+        for row in trend_rows:
+            symbol = row["symbol"]
+            row = dict(row)  # supabase 응답 복사
             row["sector"] = sector_by_symbol.get(symbol) or "Unknown"
+ 
+            fund = fund_by_symbol.get(symbol, {})
             row["revenue_q"] = fund.get("revenue_q")
             row["op_profit_q"] = fund.get("op_profit_q")
             row["net_income_q"] = fund.get("net_income_q")
@@ -868,17 +682,15 @@ def get_screener_data(refresh: str = "false"):
             row["debt_ratio"] = fund.get("debt_ratio")
             row["current_ratio"] = fund.get("current_ratio")
             row["interest_coverage"] = fund.get("interest_coverage")
-            # 영업이익률은 원본 테이블에 없지만 매출/영업이익으로 바로 계산 가능
             rev, op = fund.get("revenue_q"), fund.get("op_profit_q")
             row["op_margin"] = round(op / rev * 100, 2) if rev not in (None, 0) and op is not None else None
  
             results.append(row)
  
-        results = _attach_rs_percentile(results)
- 
         return {"status": "success", "data": results}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+ 
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
 # ==============================================================================
