@@ -16,7 +16,7 @@ import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import asyncio
-from typing import Optional, List
+from typing import Optional
 from cachetools import TTLCache, cached
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
@@ -26,7 +26,7 @@ from cryptography.fernet import Fernet
 
 # 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
 from quant_core import (
-    load_price_from_db, fetch_naver_fundamental, calc_quant_metrics, now_kst,
+    load_price_from_db, fetch_naver_fundamental, now_kst,
     load_fundamental_from_db, save_fundamental_to_db,
     # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
     evaluate_entry_gates, get_index_return_pct, load_filtered_universe,
