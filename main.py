@@ -690,7 +690,55 @@ def get_screener_data(refresh: str = "false"):
         return {"status": "success", "data": results}
     except Exception as e:
         return {"status": "error", "message": str(e)}
- 
+
+# ==============================================================================
+# 📈 [신규] 순수 DB 기반 차트 & 이동평균선 전용 API
+# ==============================================================================
+@app.get("/api/stock/chart/{symbol}")
+def get_stock_chart_data(symbol: str):
+    if not supabase:
+        return {"status": "error", "message": "DB 설정 안됨"}
+    
+    try:
+        # 1. DB에서 가격 데이터 불러오기 (quant_core의 함수 재사용)
+        # 200일 이동평균선을 계산하려면 최소 200일치의 과거 데이터가 필요하므로 넉넉히 가져옵니다.
+        df = load_price_from_db(supabase, symbol)
+        
+        if df.empty or len(df) < 2:
+            return {"status": "error", "message": "차트 데이터를 구성할 데이터가 부족합니다."}
+        
+        # 2. 파이썬(Pandas)으로 이동평균선 완벽하게 계산
+        df['ma5'] = df['Close'].rolling(window=5).mean().round(1)
+        df['ma20'] = df['Close'].rolling(window=20).mean().round(1)
+        df['ma50'] = df['Close'].rolling(window=50).mean().round(1)
+        df['ma60'] = df['Close'].rolling(window=60).mean().round(1)
+        df['ma120'] = df['Close'].rolling(window=120).mean().round(1)
+        df['ma150'] = df['Close'].rolling(window=150).mean().round(1)
+        df['ma200'] = df['Close'].rolling(window=200).mean().round(1)
+        
+        # 3. 화면에 뿌려줄 최근 120일치 데이터만 딱 잘라내기
+        df_recent = df.tail(120).copy()
+        
+        # 4. 프론트엔드가 쓰기 편한 JSON 리스트 형태로 변환
+        chart_data = []
+        for idx, row in df_recent.iterrows():
+            chart_data.append({
+                "date": idx.strftime("%Y-%m-%d"),
+                "price": float(row['Close']),
+                "ma5": float(row['ma5']) if pd.notna(row['ma5']) else None,
+                "ma20": float(row['ma20']) if pd.notna(row['ma20']) else None,
+                "ma50": float(row['ma50']) if pd.notna(row['ma50']) else None,
+                "ma60": float(row['ma60']) if pd.notna(row['ma60']) else None,
+                "ma120": float(row['ma120']) if pd.notna(row['ma120']) else None,
+                "ma150": float(row['ma150']) if pd.notna(row['ma150']) else None,
+                "ma200": float(row['ma200']) if pd.notna(row['ma200']) else None,
+            })
+            
+        return {"status": "success", "data": {"chart_data": chart_data}}
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
 # ==============================================================================
