@@ -47,8 +47,18 @@ TBL_WATCH   = "quant_watchlist_cache"
 TBL_SECTOR  = "stock_sector"   # [추가] 업종 분류 캐시 — 포트폴리오 섹터 분산용
 TBL_FUNDA_HISTORY = "stock_fundamental_history"
 TBL_FUNDA_QUARTERLY = "stock_fundamental_quarterly"
+TBL_TREND = "stock_trend_stats"
+
 QUARTER_REPRT_CODES = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
 QUARTERLY_ROUTINE_LOOKBACK = 2   # 매주 확인할 분기 개수 (최신 + 버퍼 1개)
+
+TREND_MIN_BARS = 264  # 200일선 + ma200_3m_ago(63일 전 시점의 200일선) 계산까지 안전하게 되려면
+                       # 최소 200+63+1=264행 필요. 210으로는 ma200_trend_score의 두 체크
+                       # (1개월/3개월 전 200일선)가 전부 None이 되어 _pass_ratio가 "평가 불가"를
+                       # "0점(하락 추세)"으로 잘못 등급 매기는 문제가 있었음. 264 미만 종목은
+                       # compute_trend_stats_from_closes가 기존처럼 None을 반환해 이번 배치는
+                       # 건너뛰고, 데이터가 쌓이면 자동으로 다음 배치부터 포함된다(신규 로직 아님,
+                       # 기존 "데이터 부족 스킵" 경로를 그대로 탐).
 
 ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일봉부터 삭제)
 FUNDA_TTL_SEC  = 86400 * 90
@@ -113,12 +123,19 @@ STRONG_BREAKOUT_VOL_MULT = 2.0
 # RS(상대강도) — 시장별 벤치마크 분리 (KOSPI 종목→KS11, KOSDAQ 종목→KQ11)
 RS_LOOKBACK_DAYS       = 60
 
-def get_market_regime(lookback_days: int = 300) -> dict:
+KOSPI_2ND_BUY_MDD_THRESHOLD_PCT = -20.0  # [추가] 2차 매수 국면 판단 임계값 — 단일 소스
+
+def get_market_regime(lookback_days: int = 400) -> dict:  # [수정] 252거래일 고점 확보 위해 300→400
     """
     코스피 지수 기반 시장 레짐(국면) 판정
     - BULL    : 종가가 120일선 위 + 120일선 자체가 상승 중
     - BEAR    : 종가가 120일선 아래 + 120일선 자체가 하락 중
     - NEUTRAL : 그 외 (박스권 / 전환 구간) → 보수적으로 중립 취급
+
+    [추가] kospi_mdd / is_2nd_buy_regime
+      - 52주(252거래일) 고점 대비 코스피 현재가 하락률
+      - -20% 이하로 빠졌으면 "2차 매수(불타기/물타기) 국면"으로 판정 — 종목 단위가 아닌
+        시장 전체에 적용되는 단일 플래그. 스크리너의 모든 종목 카드가 이 값을 공유한다.
     """
     try:
         end = now_kst()
@@ -131,7 +148,7 @@ def get_market_regime(lookback_days: int = 300) -> dict:
         ma120 = close.rolling(120).mean()
         curr_close = float(close.iloc[-1])
         curr_ma120 = float(ma120.iloc[-1])
-        prev_ma120 = float(ma120.iloc[-20])  # 약 1개월 전 120일선과 비교해 기울기 판정
+        prev_ma120 = float(ma120.iloc[-20])
 
         above_ma  = curr_close > curr_ma120
         ma_rising = curr_ma120 > prev_ma120
@@ -143,11 +160,19 @@ def get_market_regime(lookback_days: int = 300) -> dict:
         else:
             regime = "NEUTRAL"
 
+        # [추가] 52주(252거래일) 고점 대비 하락률
+        year_window = close.tail(252) if len(close) >= 252 else close
+        year_high = float(year_window.max())
+        kospi_mdd = round((curr_close - year_high) / year_high * 100, 2)
+
         return {
             "regime": regime,
             "kospi_close": round(curr_close, 2),
             "ma120": round(curr_ma120, 2),
             "ma120_slope_pct": round((curr_ma120 / prev_ma120 - 1) * 100, 2),
+            "kospi_year_high": round(year_high, 2),
+            "kospi_mdd": kospi_mdd,
+            "is_2nd_buy_regime": bool(kospi_mdd <= KOSPI_2ND_BUY_MDD_THRESHOLD_PCT),
         }
     except Exception as e:
         return {"regime": "NEUTRAL", "reason": f"오류: {e}"}
@@ -552,8 +577,16 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
 
     high, low, prev_close = df.get("High", close), df.get("Low", close), close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+
+    # [수정] VCP(변동성 축소) 팩터 계산을 위해 10일, 50일 단/장기 변동성 산출
+    atr10 = tr.rolling(10).mean().iloc[-1]
     atr20 = tr.rolling(20).mean().iloc[-1]
-    metrics["dynamic_mdd_limit"] = max(-40.0, min(-15.0, -((atr20 / close.iloc[-1]) * 300))) # ATR의 3배수
+    atr50 = tr.rolling(50).mean().iloc[-1]
+
+    metrics["dynamic_mdd_limit"] = max(-40.0, min(-15.0, -((atr20 / close.iloc[-1]) * 300)))  # ATR의 3배수
+
+    # [수정] 단기 변동성(10일)이 장기 변동성(50일) 대비 얼마나 축소되었는가 측정
+    metrics["atr_contraction_ratio"] = atr10 / atr50 if atr50 and atr50 > 0 else 1.0
 
     # 3. Liquidity
     metrics["liquidity_20d"] = (close * vol).iloc[-20:].mean() / 1e8
@@ -594,28 +627,40 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
     f_mdd = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
     f_liq = bool(metrics["liquidity_20d"] >= 50)
     f_trend = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"])
-                    and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+                   and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
 
     breakout_threshold = metrics["high_60d"] * 0.90
-    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
-    f_break_strong_day1 = bool((curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
+
+    # [수정] 단순 고점 근접이 아닌, VCP(변동성 축소) 셋업 확인 (최근 10일 변동성이 50일 대비 90% 이하로 수렴)
+    vcp_setup = metrics.get("atr_contraction_ratio", 1.0) <= 0.90
+
+    # 진정한 돌파는 변동성이 축소(vcp_setup)된 상태에서 발생해야 함
+    f_break_confirmed = bool(vcp_setup and (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
+    f_break_strong_day1 = bool(vcp_setup and (curr_price >= breakout_threshold) and (
+                today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
     f_break = f_break_confirmed or f_break_strong_day1
 
-    f_vol = bool((metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
+    f_vol = bool(
+        (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
 
     pass_count = int(sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol]))
     high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
     vol_60d_val = metrics["vol_60d"] if metrics["vol_60d"] > 0 else 1
 
     gates = {
-        "growth": {"pass": f_growth, "label": "Growth Composite", "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
-        "mdd":    {"pass": f_mdd,    "label": "Dynamic MDD",      "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
-        "liq":    {"pass": f_liq,    "label": "Liquidity",        "reason": f"{metrics['liquidity_20d']:.0f}억"},
-        "trend":  {"pass": f_trend,  "label": "Trend Alignment",  "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
-        "break":  {"pass": f_break,  "label": "Price Breakout",
-                    "reason": (f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1
-                               else f"고점대비 {(curr_price/high_60d_val)*100:.1f}% (2일 연속 돌파권)")},
-        "vol":    {"pass": f_vol,    "label": "Volume Surge",
+        "growth": {"pass": f_growth, "label": "Growth Composite",
+                   "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
+        "mdd": {"pass": f_mdd, "label": "Dynamic MDD",
+                "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
+        "liq": {"pass": f_liq, "label": "Liquidity", "reason": f"{metrics['liquidity_20d']:.0f}억"},
+        "trend": {"pass": f_trend, "label": "Trend Alignment",
+                  "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
+        "break": {"pass": f_break, "label": "Price Breakout",
+                  "reason": (
+                      f"VCP수렴({(metrics.get('atr_contraction_ratio', 1) * 100):.0f}%) & 1일차 강한돌파" if f_break_strong_day1
+                      else f"VCP수렴({(metrics.get('atr_contraction_ratio', 1) * 100):.0f}%) & 2일연속 돌파권" if f_break_confirmed
+                      else "VCP 수렴 미달 또는 고점 이탈")},
+        "vol": {"pass": f_vol, "label": "Volume Surge",
                     "reason": f"Vol {(metrics['vol_5d']/vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"},
     }
     return {"pass_count": pass_count, "gates": gates,
@@ -789,6 +834,26 @@ def load_backtest_result(supabase) -> dict:
     return {}
 
 # ══════════════════════════════════════════
+# [H] 시장 레짐 캐시 (id=15) — 1차/2차 매수 국면 판정용, API가 매번 fdr을 호출하지 않도록 저장
+# ══════════════════════════════════════════
+MARKET_REGIME_CACHE_ID = 15
+
+def save_market_regime_cache(supabase, regime_data: dict):
+    ts = now_kst_str()
+    supabase.table(TBL_SCREEN).upsert([
+        {"id": MARKET_REGIME_CACHE_ID, "results": json.dumps(regime_data, ensure_ascii=False, cls=NumpyEncoder), "updated_at": ts}
+    ]).execute()
+
+def load_market_regime_cache(supabase) -> dict:
+    try:
+        r = supabase.table(TBL_SCREEN).select("*").eq("id", MARKET_REGIME_CACHE_ID).execute()
+        if r.data:
+            return json.loads(r.data[0]["results"])
+    except Exception:
+        pass
+    return {}
+
+# ══════════════════════════════════════════
 # [G] 포트폴리오 레벨 리스크 관리
 #   — 20년차 퀀트 리뷰에서 지적된 최대 약점(종목 단위 리스크만 있고 계좌 단위가 없음) 보완.
 #   여기 있는 값들은 전부 "가상 기준값"이며 실계좌 자동매매를 의미하지 않습니다.
@@ -876,6 +941,110 @@ def is_correlated_with_holdings(supabase, candidate_symbol: str, holding_symbols
             return True, h_sym
     return False, None
 
+def evaluate_exit_signal(entry_price: float, entry_date, df: pd.DataFrame, regime: str) -> dict:
+    """
+    포지션 청산 판정 — 트레일링/동적손절(ATR) → 추세붕괴(레짐별 문턱) → 모멘텀소진(이익보호모드)
+    순으로 검사한다. quant_backTesting.strategy_check_exit()와 quant_cron.process_virtual_
+    portfolio() 양쪽이 반드시 이 함수 하나만 호출해야 한다 (evaluate_gates()와 동일한
+    "단일 소스" 원칙 — 파라미터를 하나 바꿀 때 두 파일을 동시에 고쳐야 하는 위험을 제거).
+
+    df: entry_date 이후 미래 정보가 섞이면 안 된다.
+        - 백테스트: slice_upto(df, t)로 look-ahead 방지된 슬라이스를 넘길 것
+        - 라이브: 오늘까지의 전체 df를 그대로 넘기면 됨 (자연히 오늘이 마지막 행이라 안전)
+    """
+    close = df["Close"]
+    vol = df["Volume"]
+    curr_price = float(close.iloc[-1])
+
+    atr_mult = REGIME_ATR_MULT.get(regime, 2.5)
+    risk_cap = REGIME_RISK_CAP.get(regime, 0.15)
+    trend_break_min = REGIME_TREND_BREAK_MIN.get(regime, 2)
+
+    df_held = df[df.index >= entry_date]
+    highest_close = float(df_held["Close"].max()) if not df_held.empty else curr_price
+
+    high, low, prev_close = df.get("High", close), df.get("Low", close), close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr20 = tr.rolling(20).mean().iloc[-1]
+
+    ret = ((curr_price - entry_price) / entry_price) * 100
+    profit_locking = ret >= PROFIT_LOCK_TRIGGER_PCT
+    effective_atr_mult = (atr_mult * PROFIT_LOCK_ATR_MULT_FACTOR) if profit_locking else atr_mult
+
+    initial_risk = min(risk_cap, (atr_mult * atr20) / entry_price) if pd.notna(atr20) else risk_cap
+    initial_stop = entry_price * (1 - initial_risk)
+    trailing_stop = (highest_close - effective_atr_mult * atr20) if pd.notna(atr20) else initial_stop
+    current_stop = max(initial_stop, trailing_stop)
+
+    ma10 = close.iloc[-10:].mean()
+    ma20 = close.iloc[-20:].mean()
+
+    # [수정] 50일선 계산 추가 (데이터 부족시 20일선으로 대체)
+    ma50 = close.iloc[-50:].mean() if len(close) >= 50 else ma20
+
+    # [수정] 3중 다수결 득점제 폐지 -> 절대 생명선 이탈 기준으로 변경
+    # 미너비니 원칙: 약세장(BEAR)에선 20일선 이탈 시 즉시 도망, 강/중립장에선 50일선 이탈 시 절대 청산
+    trend_broken = (curr_price < ma20) if regime == "BEAR" else (curr_price < ma50)
+
+    # 기존 코드와의 UI 호환성(에러 방지)을 위해 score 값을 0 또는 3으로 직관적 매핑
+    trend_break_score = 3 if trend_broken else 0
+
+    vol_5d, vol_20d = vol.iloc[-5:].mean(), vol.iloc[-20:].mean()
+    momentum_exhausted = profit_locking and (vol_5d < vol_20d * VOL_COOLING_RATIO) and (curr_price < ma10)
+
+    should_sell, reason = False, ""
+    if curr_price <= current_stop:
+        should_sell, reason = True, "트레일링/동적손절 이탈 (ATR)"
+    elif trend_broken:
+        # [수정] 어떤 선을 깨고 나왔는지 명확히 리포팅
+        broken_line = "20일선" if regime == "BEAR" else "50일선"
+        should_sell, reason = True, f"추세 생명선({broken_line}) 이탈 (레짐 {regime})"
+    elif momentum_exhausted:
+        should_sell, reason = True, f"모멘텀 소진 익절 (누적 {ret:+.1f}%)"
+
+    return {
+        "should_sell": should_sell, "reason": reason, "return_pct": round(ret, 2),
+        "current_stop": current_stop, "trend_break_score": trend_break_score,
+        "profit_locking": profit_locking,
+    }
+
+def is_correlated_with_holdings_inmemory(price_data: dict, candidate_symbol: str, holding_symbols: list, t,
+                                          lookback: int = CORR_LOOKBACK_DAYS,
+                                          threshold: float = CORR_BLOCK_THRESHOLD) -> tuple:
+    """
+    is_correlated_with_holdings()의 백테스트 전용 버전.
+    DB 재조회 없이, 이미 메모리에 로딩된 price_data(symbol -> DataFrame)를 t 시점까지
+    슬라이스해서 상관관계를 계산한다. 백테스트가 250거래일 x 후보종목 수만큼 이 체크를
+    반복해야 하므로, 매번 DB를 때리는 라이브용 함수를 그대로 쓰면 배치가 감당 못 한다.
+    판정 기준(threshold, lookback)은 라이브와 완전히 동일한 상수를 공유한다.
+    """
+    if not holding_symbols:
+        return False, None
+    df_c = price_data.get(candidate_symbol)
+    if df_c is None:
+        return False, None
+    c_slice = df_c[df_c.index <= t].tail(lookback + 1)
+    if len(c_slice) < lookback + 1:
+        return False, None
+    ret_c = c_slice["Close"].pct_change().dropna()
+
+    for h_sym in holding_symbols:
+        if h_sym == candidate_symbol:
+            continue
+        df_h = price_data.get(h_sym)
+        if df_h is None:
+            continue
+        h_slice = df_h[df_h.index <= t].tail(lookback + 1)
+        if len(h_slice) < lookback + 1:
+            continue
+        ret_h = h_slice["Close"].pct_change().dropna()
+        joined = pd.concat([ret_c, ret_h], axis=1, join="inner").dropna()
+        if len(joined) < lookback * 0.6:
+            continue
+        corr = joined.iloc[:, 0].corr(joined.iloc[:, 1])
+        if corr is not None and corr >= threshold:
+            return True, h_sym
+    return False, None
 
 # ══════════════════════════════════════════
 # [G-1] 업종(섹터) 캐시 — 상관관계 프록시를 "진짜 업종 태그" 기반으로 보강
@@ -954,7 +1123,16 @@ def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float 
 
 def backfill_fundamental_history(symbol: str, name: str, corp_code: str, dart_api_key: str, years: list) -> list:
     """DART API를 호출해서 과거 연도별 재무제표를 point-in-time 스냅샷 형태로 '조회'만 한다.
-    DB에 쓰지 않는다 — 저장은 save_fundamental_history()가 담당."""
+    DB에 쓰지 않는다 — 저장은 save_fundamental_history()가 담당.
+
+    [수정] ROE/부채비율은 fnlttSinglAcntAll(재무제표 계정과목) 응답에 애초에 존재하지 않는
+    필드였음 — 이 사실은 _dart_quarter_report()에서 이미 확인되어 명시돼 있음
+    ("이 API에는 애초에 존재하지 않는 필드, 재무비율은 _dart_index_report가 담당").
+    그런데 이 함수(backfill_fundamental_history)는 그 리팩터링에서 빠진 채, 여전히
+    account_nm에서 "ROE"/"부채비율" 텍스트를 찾고 있어서 항상 None만 채워지고 있었음.
+    → 해당 텍스트 스캔을 제거하고, _dart_index_report(fnlttSinglIndx 전용 API) 호출을
+      추가해서 실제 값이 채워지도록 수정.
+    """
     rows = []
     targets = [("11011", lambda y: f"{y+1}-03-31"), ("11012", lambda y: f"{y}-08-14")]
     for year in years:
@@ -977,8 +1155,13 @@ def backfill_fundamental_history(symbol: str, name: str, corp_code: str, dart_ap
                 if "영업이익" in acnt and "영업이익률" not in acnt and snap["op_profit"] is None: snap["op_profit"] = val_억
                 if "당기순이익" in acnt and snap["net_income"] is None: snap["net_income"] = val_억
                 if "매출액" in acnt and snap["revenue"] is None: snap["revenue"] = val_억
-                if "ROE" in acnt and snap["roe"] is None: snap["roe"] = val_raw
-                if "부채비율" in acnt and snap["debt_ratio"] is None: snap["debt_ratio"] = val_raw
+                # ← ROE/부채비율 텍스트 스캔 삭제 (이 API엔 해당 필드가 없음, 아래에서 별도 조회)
+
+            # [추가] ROE/부채비율은 재무비율 전용 API(fnlttSinglIndx)에서 조회
+            idx = _dart_index_report(corp_code, dart_api_key, year, reprt_code)
+            snap["roe"] = idx.get("roe")
+            snap["debt_ratio"] = idx.get("debt_ratio")
+
             rows.append({"symbol": symbol, "name": name, "bsns_year": year, "reprt_code": reprt_code,
                          "known_from": known_from_fn(year), "updated_at": now_kst_str(), **snap})
     return rows
@@ -1046,12 +1229,40 @@ def latest_confirmed_quarter(asof: date = None) -> tuple:
             return (year, q)
     return (y - 1, 4)
 
+QUARTERLY_RETRY_AFTER_DAYS = 14  # 핵심 필드가 채워진 분기라도 이 기간이 지나면 한 번 더 재조회
+                                  # (DART가 나중에 보완공시로 값을 채우는 경우가 있어, 최초 조회
+                                  # 시점의 결측을 영구 확정으로 취급하지 않는다)
+
+def _quarterly_row_needs_retry(row: dict, retry_after_days: int = QUARTERLY_RETRY_AFTER_DAYS) -> bool:
+    """
+    기존에 저장된 분기 row가 이번 배치에서 재시도 대상인지 판단.
+    [수정 이유] 기존 backfill_quarterly_fundamental()은 "이 (연도,분기) row가 DB에 존재하는가"
+    만으로 스킵 여부를 정했다. 그런데 _quarter_standalone()은 4개 필드(revenue/op_profit/
+    net_income/eps)가 전부 None일 때만 저장을 포기하고, 일부만 채워진 채로도 그대로 upsert된다.
+    그 결과 "revenue만 있고 net_income은 없는" row가 한 번 생기면, 존재 여부만 보는 기존
+    로직은 그 분기를 영원히 다시 조회하지 않았다 — 이번 배치의 일시적 API 오류였는지,
+    실제로 그 분기 데이터가 없는지 구분이 안 된 채로 결측이 고정되는 버그였다.
+    - 핵심 필드(revenue_q, net_income_q)가 둘 다 비어있으면 → 완전 결측이므로 항상 재시도
+    - 핵심 필드가 있어도 updated_at이 retry_after_days 이상 지났으면 → 한 번 더 재시도
+      (DART 보완공시 대응. 그 전에는 매일 재조회하지 않도록 최소한의 TTL을 둠)
+    """
+    core_missing = row.get("revenue_q") is None and row.get("net_income_q") is None
+    if core_missing:
+        return True
+    return is_expired(row.get("updated_at", ""), retry_after_days * 86400)
+
+
 def backfill_quarterly_fundamental(supabase, universe_df: pd.DataFrame, dart_api_key: str,
                                     dart_corp_map: dict, lookback_quarters: int = QUARTERLY_ROUTINE_LOOKBACK,
                                     log_fn=print) -> int:
     """
-    종목마다: ① DB에 이미 있는 분기 조회 → ② 없는 분기만 DART 호출 → ③ 있으면 insert, 없으면 넘어감.
+    종목마다: ① DB에 이미 있는 분기 조회 → ② 없거나(결측/오래됨) 재시도 대상인 분기만 DART 호출
+    → ③ 있으면 insert, 없으면 넘어감.
     DART 실패/API 소진 시 그냥 pass하고 다음 종목으로 진행 (다음 배치에서 자동 재시도됨).
+
+    [수정] 존재 여부(bsns_year,quarter)만 보던 have 집합을 _quarterly_row_needs_retry() 기반
+    판정으로 교체 — 일부 필드만 채워진 채 영구 고정되던 결측을 다음 배치들에서 다시 채울 기회를
+    준다.
     """
     latest_y, latest_q = latest_confirmed_quarter()
     target_quarters = []
@@ -1070,24 +1281,35 @@ def backfill_quarterly_fundamental(supabase, universe_df: pd.DataFrame, dart_api
             no_corp += 1
             continue
 
-        # ① DB 먼저 조회
+        # ① DB 먼저 조회 — 재시도 판단에 필요한 필드까지 함께 select
         try:
-            existing = supabase.table(TBL_FUNDA_QUARTERLY).select("bsns_year,quarter") \
+            existing = supabase.table(TBL_FUNDA_QUARTERLY) \
+                .select("bsns_year,quarter,revenue_q,net_income_q,updated_at") \
                 .eq("symbol", symbol).execute()
-            have = {(r["bsns_year"], r["quarter"]) for r in existing.data}
+            complete = {
+                (r["bsns_year"], r["quarter"])
+                for r in existing.data
+                if not _quarterly_row_needs_retry(r)
+            }
         except Exception:
-            have = set()
+            complete = set()
 
-        missing = [(yy, qq) for (yy, qq) in target_quarters if (yy, qq) not in have]
+        # ② "완전히 채워져 있고 재시도 기간도 안 지난" 분기만 스킵 대상
+        missing = [(yy, qq) for (yy, qq) in target_quarters if (yy, qq) not in complete]
         if not missing:
             skipped += 1
             continue
 
-        # ② 없는 분기만 DART 호출
+        # 같은 종목 내에서 연속 분기를 채울 때 cur/prev 요청이 겹치는 걸 줄이기 위한 메모 캐시
+        # (예: 2분기 계산의 prev=1분기 요청이 1분기 계산의 cur 요청과 같은 API 호출) —
+        # API 호출 절감은 결측을 줄이는 데도 직접 도움이 됨(레이트리밋/타임아웃으로 인한
+        # 결측이 실제 원인 중 하나였음).
+        report_cache = {}
+
         rows_to_upsert = []
         for (yy, qq) in missing:
             try:
-                vals = _quarter_standalone(corp_code, dart_api_key, yy, qq)
+                vals = _quarter_standalone(corp_code, dart_api_key, yy, qq, report_cache=report_cache)
             except Exception:
                 continue  # API 소진/오류 → 이 분기만 pass, 다음 배치에서 재시도
             if not vals:
@@ -1114,9 +1336,9 @@ def backfill_quarterly_fundamental(supabase, universe_df: pd.DataFrame, dart_api
                 log_fn(f"    [!] {name}({symbol}) 저장 실패: {e}")
 
         if (i + 1) % 200 == 0 or (i + 1) == total:
-            log_fn(f"    [{i+1}/{total}] 처리중... (신규 {filled}건, 이미최신 스킵 {skipped}종목, corp_code없음 {no_corp}종목)")
+            log_fn(f"    [{i+1}/{total}] 처리중... (신규/재시도 {filled}건, 완결스킵 {skipped}종목, corp_code없음 {no_corp}종목)")
 
-    log_fn(f"  [✓] 분기 펀더멘털 백필 완료 — 신규 {filled}건 / 이미최신 {skipped}종목 / corp_code없음 {no_corp}종목")
+    log_fn(f"  [✓] 분기 펀더멘털 백필 완료 — 신규/재시도 {filled}건 / 완결스킵 {skipped}종목 / corp_code없음 {no_corp}종목")
     return filled
 
 
@@ -1160,14 +1382,23 @@ def _parse_dart_accounts(item_list: list) -> dict:
     return out
 
 
-def _dart_quarter_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str) -> dict:
+def _dart_quarter_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str,
+                          report_cache: dict = None) -> dict:
     """
     DART 재무제표(fnlttSinglAcntAll) 조회.
     [수정 1] CFS 실패/빈값 시 OFS(개별재무제표)로 폴백 — 연결재무제표 미제출 기업 데이터 누락 방지
     [수정 2] account_id 우선 매칭으로 교체 (_parse_dart_accounts)
     [수정 3] ROE/부채비율/유동비율/이자보상배율 스캔 로직 완전 제거
              → 이 API에는 애초에 존재하지 않는 필드였음 (재무비율은 _dart_index_report가 담당)
+    [수정 4] report_cache: {(corp_code, year, reprt_code): result} 형태의 메모 캐시.
+             연속 분기 백필 시 이번 분기의 cur 요청이 다음 분기의 prev 요청과 동일한
+             (corp_code, year, reprt_code)를 다시 부르는 중복이 있었음 — 캐시로 API 호출을
+             줄여 레이트리밋/타임아웃으로 인한 결측을 완화한다.
     """
+    cache_key = (corp_code, year, reprt_code)
+    if report_cache is not None and cache_key in report_cache:
+        return report_cache[cache_key]
+
     result = {"revenue": None, "op_profit": None, "net_income": None, "eps": None}
     for fs_div in ("CFS", "OFS"):
         try:
@@ -1183,18 +1414,27 @@ def _dart_quarter_report(corp_code: str, dart_api_key: str, year: int, reprt_cod
             continue
         result = _parse_dart_accounts(res["list"])
         if any(v is not None for v in result.values()):
-            break  # CFS에서 뭐라도 건졌으면 OFS까지 안 감. CFS가 비었을 때만 OFS 시도
+            break
+
+    if report_cache is not None:
+        report_cache[cache_key] = result
     return result
 
 
-def _dart_index_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str) -> dict:
+def _dart_index_report(corp_code: str, dart_api_key: str, year: int, reprt_code: str,
+                        report_cache: dict = None) -> dict:
     """
     ROE/부채비율/유동비율/이자보상배율 조회.
     [확인됨] debt_ratio="부채비율", current_ratio="유동비율" 라벨 매칭 정상 동작 중.
     [수정] roe 라벨이 "자기자본순이익률"이 아니라 그냥 "ROE"임 — 실측 확인 완료.
     [주의] interest_coverage는 이자비용이 미미한 우량기업(삼성전자 등)은
            DART가 아예 계산하지 않고 None으로 옴 — 정상 동작, 코드 문제 아님.
+    [추가] report_cache — _dart_quarter_report와 동일한 목적의 메모 캐시(별도 네임스페이스로 저장).
     """
+    cache_key = ("idx", corp_code, year, reprt_code)
+    if report_cache is not None and cache_key in report_cache:
+        return report_cache[cache_key]
+
     ratios = {"roe": None, "debt_ratio": None, "current_ratio": None, "interest_coverage": None}
     for idx_cl_code in ("M210000", "M220000"):
         try:
@@ -1222,21 +1462,29 @@ def _dart_index_report(corp_code: str, dart_api_key: str, year: int, reprt_code:
                     ratios["interest_coverage"] = val
         except Exception:
             pass
+
+    if report_cache is not None:
+        report_cache[cache_key] = ratios
     return ratios
 
 
-def _quarter_standalone(corp_code: str, dart_api_key: str, year: int, quarter: int) -> dict:
+def _quarter_standalone(corp_code: str, dart_api_key: str, year: int, quarter: int,
+                         report_cache: dict = None) -> dict:
     """
     분기 단독값 = 해당분기 누적 - 직전분기 누적 (1분기는 그 자체가 단독값).
     [수정] net_income 하나가 None이라고 EPS/revenue/op_profit까지 전부 버리던 게이트를 제거.
            필드별로 독립적으로 살아남게 함 — "EPS만 왜 계속 안 채워지지" 현상의 직접 원인이었음.
            완전히 빈 응답(4개 필드 다 None)일 때만 그 분기를 포기.
+    [추가] report_cache를 그대로 하위 호출에 전달 — 같은 (corp_code, year, reprt_code) 조합이
+    이번 분기의 cur와 다음 분기의 prev로 중복 조회되는 것을 방지.
     """
-    cur = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter])
+    cur = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter],
+                                report_cache=report_cache)
     if not any(v is not None for v in cur.values()):
         return {}  # 진짜 아무 것도 못 가져온 경우만 포기
 
-    idx = _dart_index_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter])
+    idx = _dart_index_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter],
+                              report_cache=report_cache)
     out = {"roe": idx["roe"], "debt_ratio": idx["debt_ratio"],
            "current_ratio": idx["current_ratio"], "interest_coverage": idx["interest_coverage"]}
 
@@ -1244,10 +1492,177 @@ def _quarter_standalone(corp_code: str, dart_api_key: str, year: int, quarter: i
         out.update({k: cur.get(k) for k in ["revenue", "op_profit", "net_income", "eps"]})
         return out
 
-    prev = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter - 1])
+    prev = _dart_quarter_report(corp_code, dart_api_key, year, QUARTER_REPRT_CODES[quarter - 1],
+                                 report_cache=report_cache)
     for k in ["revenue", "op_profit", "net_income", "eps"]:
         if cur.get(k) is not None and prev.get(k) is not None:
             out[k] = cur[k] - prev[k]
         else:
-            out[k] = None  # 이 필드만 결측, 나머지는 살아있으면 그대로 저장됨
+            out[k] = None
     return out
+
+
+def _pass_ratio(checks) -> float:
+    valid = [c for c in checks if c is not None]
+    if not valid:
+        return 0.0
+    return round(sum(1 for c in valid if c) / len(valid) * 100, 1)
+
+
+def compute_trend_stats_from_closes(symbol: str, name: str, closes) -> dict | None:
+    """
+    [수정됨] 절대 기준(Absolute Criteria) 적용
+    부분 점수(_pass_ratio)를 폐지하고, 미너비니의 핵심 템플릿 조건(AND)을
+    완벽히 충족할 때만 100점, 하나라도 미달이면 0점 처리.
+
+    [추가] 1차/2차 매수 판정용 플래그
+      - is_value_buy : 200일선 근처(+5% 이내)로 눌렸고, 동시에 볼린저 하단(20,2)까지 이탈한 눌림목
+      - is_second_buy: 52주 고점 대비 20% 이상 하락 (물타기/불타기 판단용, 종목 자체 기준)
+    """
+    s = pd.Series(closes).dropna().reset_index(drop=True)
+    n = len(s)
+    if n < TREND_MIN_BARS:
+        return None
+
+    ma50 = s.rolling(50).mean()
+    ma150 = s.rolling(150).mean()
+    ma200 = s.rolling(200).mean()
+
+    # [추가] 볼린저 밴드 하단 (20일, 2표준편차) — 1차 매수(가치매수) 판정용
+    bb_mid20 = s.rolling(20).mean()
+    bb_std20 = s.rolling(20).std()
+    bb_lower = bb_mid20 - 2 * bb_std20
+    bb_lower_now = bb_lower.iloc[-1]
+
+    price = float(s.iloc[-1])
+    ma50_now, ma150_now, ma200_now = ma50.iloc[-1], ma150.iloc[-1], ma200.iloc[-1]
+
+    if pd.isna(ma150_now) or pd.isna(ma200_now):
+        return None
+
+    def _at(series, back):
+        idx = n - 1 - back
+        if idx < 0:
+            return None
+        v = series.iloc[idx]
+        return None if pd.isna(v) else v
+
+    ma200_1m_ago = _at(ma200, 21)
+    ma200_3m_ago = _at(ma200, 63)
+    ma50_2w_ago = _at(ma50, 10)
+
+    lookback = min(n, 252)
+    recent = s.iloc[-lookback:]
+    w52_high = float(recent.max())
+    w52_low = float(recent.min())
+
+    # 1. 정배열 (Trend Alignment): 가격 > 50MA > 150MA > 200MA 완벽 충족
+    is_aligned = (
+            pd.notna(ma50_now) and
+            price > ma50_now and
+            ma50_now > ma150_now and
+            ma150_now > ma200_now
+    )
+    trend_alignment_score = 100 if is_aligned else 0
+
+    # 2. 200일선 추세: 1개월 전 및 3개월 전 대비 200일선이 모두 상승 중이어야 함
+    is_ma200_trending = (
+            ma200_1m_ago is not None and ma200_now > ma200_1m_ago and
+            ma200_3m_ago is not None and ma200_now > ma200_3m_ago
+    )
+    ma200_trend_score = 100 if is_ma200_trending else 0
+
+    # 3. 고점 근접성: 미너비니의 절대 기준인 '52주 고점 대비 25% 이내'를 하드 조건으로 설정
+    pct_from_high = (w52_high - price) / w52_high * 100 if w52_high else None
+    high_proximity_score = 100 if (pct_from_high is not None and pct_from_high <= 25) else 0
+
+    # 4. 저점 탈출: 신저가 대비 30% 이상 상승
+    pct_above_low = (price - w52_low) / w52_low * 100 if w52_low else None
+    low_rise_score = 100 if (pct_above_low is not None and pct_above_low >= 30) else 0
+
+    # 5. 50일선 모멘텀: 가격이 50일선 위에 있고, 50일선 자체가 과거(2주전) 대비 상승 중일 것
+    is_ma50_trending = (
+            pd.notna(ma50_now) and ma50_2w_ago is not None and
+            price > ma50_now and
+            ma50_now > ma50_2w_ago
+    )
+    ma50_momentum_score = 100 if is_ma50_trending else 0
+
+    # 6. 모멘텀 팩터 (RS 점수 산출 등 순위 매김용 팩터이므로 기존 로직 유지)
+    def _ret(back):
+        idx = n - 1 - back
+        if idx < 0 or s.iloc[idx] == 0:
+            return None
+        return (price - s.iloc[idx]) / s.iloc[idx]
+
+    ret_3m, ret_6m, ret_9m, ret_12m = _ret(63), _ret(126), _ret(189), _ret(252)
+    weights = [0.4, 0.2, 0.2, 0.2]
+    pairs = [(weights[0], ret_3m), (weights[1], ret_6m), (weights[2], ret_9m), (weights[3], ret_12m)]
+    valid_pairs = [(w, r) for w, r in pairs if r is not None]
+    raw_momentum = (sum(w * r for w, r in valid_pairs) / sum(w for w, _ in valid_pairs)) if valid_pairs else None
+
+    ret_1m = _ret(21)
+
+    # [추가] 1차 매수(가치매수): 200일선 근처(+5% 이내로 하락) AND 볼린저 하단 이탈
+    is_near_200ma = pd.notna(ma200_now) and price <= ma200_now * 1.05
+    is_below_bb = pd.notna(bb_lower_now) and price < bb_lower_now
+    is_value_buy = bool(is_near_200ma and is_below_bb)
+
+    return {
+        "symbol": symbol,
+        "name": name,
+        "current_price": round(price),
+        "ma50": round(ma50_now, 1) if pd.notna(ma50_now) else None,
+        "ma150": round(ma150_now, 1),
+        "ma200": round(ma200_now, 1),
+        "week52_high": round(w52_high),
+        "week52_low": round(w52_low),
+        "pct_from_52w_high": round(pct_from_high, 1) if pct_from_high is not None else None,
+        "pct_above_52w_low": round(pct_above_low, 1) if pct_above_low is not None else None,
+        "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
+        "trend_alignment_score": trend_alignment_score,
+        "ma200_trend_score": ma200_trend_score,
+        "high_proximity_score": high_proximity_score,
+        "low_rise_score": low_rise_score,
+        "ma50_momentum_score": ma50_momentum_score,
+        "bb_lower": round(bb_lower_now, 1) if pd.notna(bb_lower_now) else None,
+        "is_value_buy": is_value_buy,
+        "_raw_momentum": raw_momentum,
+    }
+
+
+def _attach_rs_percentile_and_gates(rows: list) -> list:
+    momentum_vals = sorted(r["_raw_momentum"] for r in rows if r["_raw_momentum"] is not None)
+    for r in rows:
+        v = r.pop("_raw_momentum")
+        if v is not None and momentum_vals:
+            rank = sum(1 for x in momentum_vals if x <= v) / len(momentum_vals)
+            r["rs_score"] = round(max(1, min(99, rank * 99)))
+        else:
+            r["rs_score"] = None
+        axis_scores = [
+            r["trend_alignment_score"], r["ma200_trend_score"], r["high_proximity_score"],
+            r["low_rise_score"], r["ma50_momentum_score"], r["rs_score"] or 0,
+        ]
+        r["entry_gate_pass_count"] = sum(1 for s in axis_scores if s is not None and s >= 70)
+    return rows
+
+
+def save_trend_stats_rows(supabase, rows: list) -> int:
+    """계산이 끝난 rows를 stock_trend_stats에 upsert만 하는 저장 전용 함수.
+    (계산과 저장을 분리해서, 계산 로직은 API fetcher가 뭐든 재사용 가능하게)"""
+    if not rows:
+        print("  [x] 저장할 트렌드 지표가 없습니다.")
+        return 0
+    rows = _attach_rs_percentile_and_gates(rows)
+    ts = now_kst_str()
+    for r in rows:
+        r["updated_at"] = ts
+    try:
+        for i in range(0, len(rows), 500):
+            supabase.table(TBL_TREND).upsert(rows[i:i + 500], on_conflict="symbol").execute()
+        print(f"  [✓] stock_trend_stats 갱신 완료 ({len(rows)}종목)")
+    except Exception as e:
+        print(f"  [x] stock_trend_stats 저장 실패: {e}")
+        return 0
+    return len(rows)
