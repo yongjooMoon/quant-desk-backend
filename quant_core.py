@@ -1603,10 +1603,22 @@ def compute_trend_stats_from_closes(symbol: str, name: str, closes) -> dict | No
 
     ret_1m = _ret(21)
 
-    # [추가] 1차 매수(가치매수): 200일선 근처(+5% 이내로 하락) AND 볼린저 하단 이탈
+    # [수정] 1차 매수(눌림목 반등): "하단 이탈 시점"이 아니라 "이탈 후 반등 확인" 시점에 신호
+    # 1. 200일선 근처(200일선 위/아래 5% 이내)
+    # 2. 전일 종가가 볼린저 하단 아래로 이탈해 있었음 (저점 형성 확인)
+    # 3. 오늘 종가가 전일 대비 상승 (반등 확인)
+    # 4. 오늘 종가가 볼린저 하단 위로 복귀 (밴드 재진입 확인)
+    prev_close = float(s.iloc[-2]) if n >= 2 else None
+    prev_bb_lower = bb_lower.iloc[-2] if n >= 2 else None
+
     is_near_200ma = pd.notna(ma200_now) and price <= ma200_now * 1.05
-    is_below_bb = pd.notna(bb_lower_now) and price < bb_lower_now
-    is_value_buy = bool(is_near_200ma and is_below_bb)
+    prev_below_lower = (
+            prev_close is not None and pd.notna(prev_bb_lower) and prev_close < prev_bb_lower
+    )
+    rebound = prev_close is not None and price > prev_close
+    return_inside = pd.notna(bb_lower_now) and price >= bb_lower_now
+
+    is_value_buy = bool(is_near_200ma and prev_below_lower and rebound and return_inside)
 
     return {
         "symbol": symbol,
