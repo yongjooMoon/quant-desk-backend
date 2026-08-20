@@ -29,7 +29,7 @@ from quant_core import (
     load_price_from_db, fetch_naver_fundamental, now_kst,
     load_fundamental_from_db, save_fundamental_to_db,
     # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
-    evaluate_entry_gates, get_index_return_pct, load_filtered_universe,
+    evaluate_entry_gates, get_index_return_pct, load_filtered_universe, load_market_regime_cache,
 )
 from real_estate import generate_excel_data
 
@@ -646,16 +646,21 @@ def get_screener_data(refresh: str = "false"):
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        # 1) 트렌드 지표 캐시 (배치가 매일 계산해둔 것 — 여기가 메인 데이터)
+        # 1) 트렌드 지표 캐시
         trend_rows = fetch_all_rows(supabase.table("stock_trend_stats").select("*"))
         if not trend_rows:
             return {"status": "error", "message": "stock_trend_stats가 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)"}
- 
+
+        # 🌟 [추가] 시장 레짐(코스피 -20% 여부) — 하루 1번 배치가 저장해 둔 캐시를 읽어
+        #    모든 종목 카드에 동일하게 붙여준다 (종목별 계산이 아니라 시장 전체 단일 플래그)
+        regime_cache = load_market_regime_cache(supabase)
+        is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
+
         # 2) 섹터
         sector_rows = fetch_all_rows(supabase.table("stock_sector").select("symbol,sector"))
         sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
- 
-        # 3) 최신 분기 재무 (symbol별 최신 1건만 채택)
+
+        # 3) 최신 분기 재무
         fundamentals = fetch_all_rows(
             supabase.table("stock_fundamental_quarterly")
             .select("symbol,bsns_year,quarter,revenue_q,op_profit_q,net_income_q,"
@@ -666,13 +671,13 @@ def get_screener_data(refresh: str = "false"):
         fund_by_symbol = {}
         for row in fundamentals:
             fund_by_symbol.setdefault(row["symbol"], row)
- 
+
         results = []
         for row in trend_rows:
             symbol = row["symbol"]
-            row = dict(row)  # supabase 응답 복사
+            row = dict(row)
             row["sector"] = sector_by_symbol.get(symbol) or "Unknown"
- 
+
             fund = fund_by_symbol.get(symbol, {})
             row["revenue_q"] = fund.get("revenue_q")
             row["op_profit_q"] = fund.get("op_profit_q")
@@ -684,9 +689,12 @@ def get_screener_data(refresh: str = "false"):
             row["interest_coverage"] = fund.get("interest_coverage")
             rev, op = fund.get("revenue_q"), fund.get("op_profit_q")
             row["op_margin"] = round(op / rev * 100, 2) if rev not in (None, 0) and op is not None else None
- 
+
+            # 🌟 [추가] 시장 국면 플래그를 모든 row에 동일하게 부착
+            row["is_second_buy_regime"] = is_2nd_buy_regime
+
             results.append(row)
- 
+
         return {"status": "success", "data": results}
     except Exception as e:
         return {"status": "error", "message": str(e)}
