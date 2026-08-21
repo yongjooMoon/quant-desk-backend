@@ -27,8 +27,7 @@ from cryptography.fernet import Fernet
 # 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
 from quant_core import (
     load_price_from_db, fetch_naver_fundamental, now_kst,
-    load_fundamental_from_db, save_fundamental_to_db,
-    # 🧪 [추가] 배치 스크리닝과 완전히 동일한 6관문 판정 로직 + 시장별 RS 벤치마크 조회
+    load_fundamental_from_db, save_fundamental_to_db, load_full_krx_universe,
     evaluate_entry_gates, get_index_return_pct, load_filtered_universe, load_market_regime_cache,
 )
 from real_estate import generate_excel_data
@@ -260,7 +259,7 @@ def get_krx_list(refresh: str = "false"):
     if refresh.lower() == "true":
         krx_cache.clear()
     try:
-        df = load_filtered_universe()
+        df = load_full_krx_universe()
         records = [
             {
                 "Symbol": row["Symbol"],
