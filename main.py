@@ -27,8 +27,9 @@ from cryptography.fernet import Fernet
 # 기존 quant_core 및 real_estate 모듈 활용 (decrypt_text 제거, 기존 방식 복구)
 from quant_core import (
     load_price_from_db, fetch_naver_fundamental, now_kst,
-    load_fundamental_from_db, save_fundamental_to_db, load_full_krx_universe,
+    load_fundamental_from_db, save_fundamental_to_db,
     evaluate_entry_gates, get_index_return_pct, load_filtered_universe, load_market_regime_cache,
+    fetch_all_rows,   # ← 추가 (quant_core로 옮긴 공통 유틸 재사용)
 )
 from real_estate import generate_excel_data
 
@@ -610,33 +611,7 @@ def get_backtesting_result(refresh: str = "false"):
 #    프론트에서 새로고침 버튼 누르면 refresh=true로 캐시를 비우고 다시 읽음.
 SCREENER_CACHE_TTL = 3600
 screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
- 
- 
-def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
-    """Supabase REST 기본 1000행 제한 대응 페이지네이션 + 일시적 커넥션 종료 재시도.
-    stock_trend_stats/stock_sector/stock_fundamental_quarterly 모두 종목당 1행이라
-    이전(stock_daily 전체)보다 페이지 수 자체가 훨씬 적어져서 끊길 위험도 크게 줄어듦."""
-    all_rows = []
-    start = 0
-    while True:
-        attempt = 0
-        while True:
-            try:
-                res = query_builder.range(start, start + page_size - 1).execute()
-                break
-            except Exception:
-                attempt += 1
-                if attempt > max_retries:
-                    raise
-                time.sleep((0.4 * (2 ** (attempt - 1))) + random.uniform(0, 0.3))
-        rows = res.data or []
-        all_rows.extend(rows)
-        if len(rows) < page_size:
-            break
-        start += page_size
-    return all_rows
- 
- 
+
 @app.get("/api/screener")
 @cached(cache=screener_result_cache)
 def get_screener_data(refresh: str = "false"):
@@ -645,54 +620,16 @@ def get_screener_data(refresh: str = "false"):
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        # 1) 트렌드 지표 캐시
-        trend_rows = fetch_all_rows(supabase.table("stock_trend_stats").select("*"))
-        if not trend_rows:
-            return {"status": "error", "message": "stock_trend_stats가 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)"}
+        results = fetch_all_rows(supabase.table("stock_screener_snapshot").select("*"))
+        if not results:
+            return {"status": "error", "message": "stock_screener_snapshot이 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)"}
 
-        # 🌟 [추가] 시장 레짐(코스피 -20% 여부) — 하루 1번 배치가 저장해 둔 캐시를 읽어
-        #    모든 종목 카드에 동일하게 붙여준다 (종목별 계산이 아니라 시장 전체 단일 플래그)
+        # 레짐은 배치 시점 값이 스냅샷에 이미 박혀있지만, 장중 갱신 사이의 미세한 지연을
+        # 없애기 위해 가벼운 단일 행 조회로 최신값을 덮어씀 (비용 거의 없음)
         regime_cache = load_market_regime_cache(supabase)
         is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
-
-        # 2) 섹터
-        sector_rows = fetch_all_rows(supabase.table("stock_sector").select("symbol,sector"))
-        sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
-
-        # 3) 최신 분기 재무
-        fundamentals = fetch_all_rows(
-            supabase.table("stock_fundamental_quarterly")
-            .select("symbol,bsns_year,quarter,revenue_q,op_profit_q,net_income_q,"
-                     "eps_q,roe,debt_ratio,current_ratio,interest_coverage")
-            .order("bsns_year", desc=True)
-            .order("quarter", desc=True)
-        )
-        fund_by_symbol = {}
-        for row in fundamentals:
-            fund_by_symbol.setdefault(row["symbol"], row)
-
-        results = []
-        for row in trend_rows:
-            symbol = row["symbol"]
-            row = dict(row)
-            row["sector"] = sector_by_symbol.get(symbol) or "Unknown"
-
-            fund = fund_by_symbol.get(symbol, {})
-            row["revenue_q"] = fund.get("revenue_q")
-            row["op_profit_q"] = fund.get("op_profit_q")
-            row["net_income_q"] = fund.get("net_income_q")
-            row["eps_q"] = fund.get("eps_q")
-            row["roe"] = fund.get("roe")
-            row["debt_ratio"] = fund.get("debt_ratio")
-            row["current_ratio"] = fund.get("current_ratio")
-            row["interest_coverage"] = fund.get("interest_coverage")
-            rev, op = fund.get("revenue_q"), fund.get("op_profit_q")
-            row["op_margin"] = round(op / rev * 100, 2) if rev not in (None, 0) and op is not None else None
-
-            # 🌟 [추가] 시장 국면 플래그를 모든 row에 동일하게 부착
+        for row in results:
             row["is_second_buy_regime"] = is_2nd_buy_regime
-
-            results.append(row)
 
         return {"status": "success", "data": results}
     except Exception as e:
