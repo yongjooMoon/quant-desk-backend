@@ -1877,3 +1877,26 @@ def build_screener_snapshot(supabase, log_fn=print) -> int:
         log_fn(f"  [x] 스크리너 스냅샷 저장 실패: {e}")
         return 0
     return len(snapshot_rows)
+
+def load_full_krx_universe() -> pd.DataFrame:
+    """
+    스크리너 전용 — 시가총액/거래대금 유동성 필터를 걸지 않고 코스피+코스닥 전체 상장
+    종목을 로딩한다. 매매 전략용 load_filtered_universe()와 달리, 스크리너는 "이 종목이
+    왜 안 보이지"가 없어야 하므로 최소한의 비교불가 종목(ETF/ETN/스팩/우선주/6자리
+    코드가 아닌 것)만 제외하고 나머지는 전부 포함한다.
+    """
+    df = fdr.StockListing('KRX')
+
+    name = df["Name"].astype(str)
+    code = df["Code"].astype(str) if "Code" in df.columns else df["Symbol"].astype(str)
+
+    is_spac = name.str.contains(r"스팩|기업인수", regex=True, na=False)
+    is_preferred = name.str.match(r".+\d?우[A-Z]?$", na=False)   # OO우, OO우B 등 우선주
+    is_etf_etn = df.get("Market", pd.Series(dtype=str)).astype(str).str.contains("ETF|ETN", na=False)
+    is_valid_code = code.str.len() == 6
+
+    keep = is_valid_code & ~(is_spac | is_preferred | is_etf_etn)
+    df = df[keep].copy()
+    df = df.rename(columns={"Code": "Symbol"}) if "Code" in df.columns else df
+
+    return df[["Symbol", "Name", "Market"]].reset_index(drop=True)
