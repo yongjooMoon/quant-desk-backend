@@ -16,6 +16,7 @@ import json, re, time
 import requests
 import pandas as pd
 import numpy as np
+import random  # 파일 상단 import 블록에 추가
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
@@ -48,6 +49,7 @@ TBL_SECTOR  = "stock_sector"   # [추가] 업종 분류 캐시 — 포트폴리�
 TBL_FUNDA_HISTORY = "stock_fundamental_history"
 TBL_FUNDA_QUARTERLY = "stock_fundamental_quarterly"
 TBL_TREND = "stock_trend_stats"
+TBL_SCREENER_SNAPSHOT = "stock_screener_snapshot"
 
 QUARTER_REPRT_CODES = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
 QUARTERLY_ROUTINE_LOOKBACK = 2   # 매주 확인할 분기 개수 (최신 + 버퍼 1개)
@@ -64,6 +66,10 @@ ROLLING_DAYS   = 720   # stock_daily 보관 일수 (721일째 되는 옛날 일�
 FUNDA_TTL_SEC  = 86400 * 90
 PREFILTER_MARCAP_억 = 1500
 PREFILTER_TVOL_억   = 50
+
+# 성장주 판정 기준 (CANSLIM 'C' 원칙 — 전년 동기 대비 YoY, QoQ 아님)
+GROWTH_YOY_MIN_PCT = 0.0   # 매출/이익 YoY 성장률 최소 기준(%). 기본은 "플러스 성장"이면 통과.
+                            # CANSLIM 원칙상 강한 성장은 통상 20~25%를 기준으로 삼음 — 필요시 조정.
 
 # 확정/워치리스트 필터 기준 (절대 기준)
 CONFIRM_FILTER_MIN  = 6     # 6개 강력한 추격매수 조건 ALL PASS
@@ -577,16 +583,8 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
 
     high, low, prev_close = df.get("High", close), df.get("Low", close), close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-
-    # [수정] VCP(변동성 축소) 팩터 계산을 위해 10일, 50일 단/장기 변동성 산출
-    atr10 = tr.rolling(10).mean().iloc[-1]
     atr20 = tr.rolling(20).mean().iloc[-1]
-    atr50 = tr.rolling(50).mean().iloc[-1]
-
     metrics["dynamic_mdd_limit"] = max(-40.0, min(-15.0, -((atr20 / close.iloc[-1]) * 300)))  # ATR의 3배수
-
-    # [수정] 단기 변동성(10일)이 장기 변동성(50일) 대비 얼마나 축소되었는가 측정
-    metrics["atr_contraction_ratio"] = atr10 / atr50 if atr50 and atr50 > 0 else 1.0
 
     # 3. Liquidity
     metrics["liquidity_20d"] = (close * vol).iloc[-20:].mean() / 1e8
@@ -630,14 +628,9 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
                    and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
 
     breakout_threshold = metrics["high_60d"] * 0.90
-
-    # [수정] 단순 고점 근접이 아닌, VCP(변동성 축소) 셋업 확인 (최근 10일 변동성이 50일 대비 90% 이하로 수렴)
-    vcp_setup = metrics.get("atr_contraction_ratio", 1.0) <= 0.90
-
-    # 진정한 돌파는 변동성이 축소(vcp_setup)된 상태에서 발생해야 함
-    f_break_confirmed = bool(vcp_setup and (curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
-    f_break_strong_day1 = bool(vcp_setup and (curr_price >= breakout_threshold) and (
-                today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
+    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
+    f_break_strong_day1 = bool(
+        (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
     f_break = f_break_confirmed or f_break_strong_day1
 
     f_vol = bool(
@@ -656,12 +649,10 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
         "trend": {"pass": f_trend, "label": "Trend Alignment",
                   "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
         "break": {"pass": f_break, "label": "Price Breakout",
-                  "reason": (
-                      f"VCP수렴({(metrics.get('atr_contraction_ratio', 1) * 100):.0f}%) & 1일차 강한돌파" if f_break_strong_day1
-                      else f"VCP수렴({(metrics.get('atr_contraction_ratio', 1) * 100):.0f}%) & 2일연속 돌파권" if f_break_confirmed
-                      else "VCP 수렴 미달 또는 고점 이탈")},
+                  "reason": (f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1
+                             else f"고점대비 {(curr_price / high_60d_val) * 100:.1f}% (2일 연속 돌파권)")},
         "vol": {"pass": f_vol, "label": "Volume Surge",
-                    "reason": f"Vol {(metrics['vol_5d']/vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"},
+                "reason": f"Vol {(metrics['vol_5d'] / vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"},
     }
     return {"pass_count": pass_count, "gates": gates,
             "f_growth": f_growth, "f_mdd": f_mdd, "f_liq": f_liq,
@@ -1179,6 +1170,69 @@ def load_fundamental_history(supabase, symbol: str) -> list:
     except Exception:
         return []
 
+def load_fundamental_quarterly_history(supabase, symbol: str) -> list:
+    """
+    stock_fundamental_quarterly에 이미 저장된(=backfill_quarterly_fundamental이 주기적으로
+    채워둔) 분기 데이터를 그대로 조회만 한다. DART 호출 없음 — 백테스트 전용 읽기 경로.
+    get_fundamental_history_cached()와 달리 캐시 미스여도 DART를 부르지 않는다:
+    분기 데이터 백필은 별도 배치의 책임이고, 백테스트는 그 결과를 읽기만 한다.
+    """
+    try:
+        res = supabase.table(TBL_FUNDA_QUARTERLY) \
+            .select("bsns_year,quarter,revenue_q,op_profit_q,net_income_q,known_from") \
+            .eq("symbol", symbol).order("bsns_year").order("quarter").execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def build_asof_fund_dict_from_quarterly(quarterly_history: list, asof_date) -> dict:
+    """
+    asof_date 시점에 이미 공시되어 있었을 분기(known_from <= asof)만 써서
+    TTM(최근 4개 분기 합 = 연간 근사치) cur/prev를 만든다.
+    - cur  = 가장 최근 4개 분기 합
+    - prev = 그 직전 4개 분기 합 (1년 전 TTM)
+    4개 분기 중 하나라도 비어있으면 해당 필드는 None으로 남기고(무리하게 3개로 근사하지 않음),
+    calc_quant_metrics.safe_yoy()가 None을 만나면 growth_composite 기여분을 0으로 처리해
+    기존 build_asof_fund_dict()와 동일하게 안전히 동작한다.
+    ⚠️ 수급(foreign/institute_net_buy)은 과거 재현 불가 → 0으로 중립화 (기존과 동일).
+    """
+    asof_str = asof_date.strftime("%Y-%m-%d") if hasattr(asof_date, "strftime") else str(asof_date)
+    known = sorted(
+        [q for q in quarterly_history if q.get("known_from", "9999-99-99") <= asof_str],
+        key=lambda q: (q["bsns_year"], q["quarter"])
+    )
+    if len(known) < 4:
+        return {}
+
+    def _ttm_sum(quarters: list, field: str):
+        vals = [q.get(field) for q in quarters]
+        return None if any(v is None for v in vals) else sum(vals)
+
+    cur_q4 = known[-4:]
+    cur = {
+        "net_income": _ttm_sum(cur_q4, "net_income_q"),
+        "op_profit": _ttm_sum(cur_q4, "op_profit_q"),
+        "revenue": _ttm_sum(cur_q4, "revenue_q"),
+    }
+
+    if len(known) >= 8:
+        prev_q4 = known[-8:-4]
+        prev = {
+            "net_income": _ttm_sum(prev_q4, "net_income_q"),
+            "op_profit": _ttm_sum(prev_q4, "op_profit_q"),
+            "revenue": _ttm_sum(prev_q4, "revenue_q"),
+        }
+    else:
+        prev = {"net_income": None, "op_profit": None, "revenue": None}
+
+    return {
+        "net_income_cur": cur["net_income"], "net_income_prev": prev["net_income"],
+        "op_profit_cur": cur["op_profit"], "op_profit_prev": prev["op_profit"],
+        "revenue_cur": cur["revenue"], "revenue_prev": prev["revenue"],
+        "foreign_net_buy": 0, "institute_net_buy": 0,
+    }
+
 def get_fundamental_history_cached(supabase, symbol: str, name: str, corp_code: str,
                                     dart_api_key: str, years: list) -> list:
     """캐시(DB)에 없는 연도만 DART로 채우고 저장한 뒤 반환. 이미 있는 연도는 DART를 다시 안 부른다."""
@@ -1515,9 +1569,13 @@ def compute_trend_stats_from_closes(symbol: str, name: str, closes) -> dict | No
     부분 점수(_pass_ratio)를 폐지하고, 미너비니의 핵심 템플릿 조건(AND)을
     완벽히 충족할 때만 100점, 하나라도 미달이면 0점 처리.
 
-    [추가] 1차/2차 매수 판정용 플래그
-      - is_value_buy : 200일선 근처(+5% 이내)로 눌렸고, 동시에 볼린저 하단(20,2)까지 이탈한 눌림목
-      - is_second_buy: 52주 고점 대비 20% 이상 하락 (물타기/불타기 판단용, 종목 자체 기준)
+    [재정의] is_value_buy — 200일선 눌림목 + 볼린저 하단 이탈 (반등 확인 제거)
+      기존에는 "볼린저 하단을 이탈했다가 오늘 반등해서 밴드 안으로 복귀"까지 확인하는
+      되돌림 확정형 신호였음. 이번 수정으로 "최근 5일 내 200일선 ±5% 근접" + "오늘 종가가
+      볼린저 하단(20,2) 아래"라는 두 조건만으로 즉시 신호를 발생시키도록 단순화함
+      (반등을 기다리지 않으므로 더 빠르게, 더 자주 잡힘 — 대신 되돌림 없이 계속
+      하락할 리스크는 커짐. 성장주 필터는 이 함수 밖, main.py의 조회 시점에서 결합).
+      필드명은 프론트엔드 호환을 위해 is_value_buy 그대로 유지.
     """
     s = pd.Series(closes).dropna().reset_index(drop=True)
     n = len(s)
@@ -1528,7 +1586,7 @@ def compute_trend_stats_from_closes(symbol: str, name: str, closes) -> dict | No
     ma150 = s.rolling(150).mean()
     ma200 = s.rolling(200).mean()
 
-    # [추가] 볼린저 밴드 하단 (20일, 2표준편차) — 1차 매수(가치매수) 판정용
+    # 볼린저 밴드 하단 (20일, 2표준편차) — 1차 매수(눌림목) 판정용
     bb_mid20 = s.rolling(20).mean()
     bb_std20 = s.rolling(20).std()
     bb_lower = bb_mid20 - 2 * bb_std20
@@ -1603,22 +1661,28 @@ def compute_trend_stats_from_closes(symbol: str, name: str, closes) -> dict | No
 
     ret_1m = _ret(21)
 
-    # [수정] 1차 매수(눌림목 반등): "하단 이탈 시점"이 아니라 "이탈 후 반등 확인" 시점에 신호
-    # 1. 200일선 근처(200일선 위/아래 5% 이내)
-    # 2. 전일 종가가 볼린저 하단 아래로 이탈해 있었음 (저점 형성 확인)
-    # 3. 오늘 종가가 전일 대비 상승 (반등 확인)
-    # 4. 오늘 종가가 볼린저 하단 위로 복귀 (밴드 재진입 확인)
-    prev_close = float(s.iloc[-2]) if n >= 2 else None
-    prev_bb_lower = bb_lower.iloc[-2] if n >= 2 else None
+    # ==========================================
+    # is_value_buy [재정의]: 200일선 눌림 + 볼린저 하단 이탈 (반등 확인 없음)
+    # ==========================================
+    TOUCH_MA200_BAND_PCT = 0.05   # ±5%
+    TOUCH_MA200_LOOKBACK = 5      # 최근 5거래일 내 근접 여부
 
-    is_near_200ma = pd.notna(ma200_now) and price <= ma200_now * 1.05
-    prev_below_lower = (
-            prev_close is not None and pd.notna(prev_bb_lower) and prev_close < prev_bb_lower
+    recent_price = s.iloc[-TOUCH_MA200_LOOKBACK:]
+    recent_ma200 = ma200.iloc[-TOUCH_MA200_LOOKBACK:]
+
+    # 최근 5거래일 중 한 번이라도 200일선 ±5% 영역에 접근했는지
+    near_200ma_recent = (
+            len(recent_price) == TOUCH_MA200_LOOKBACK
+            and recent_ma200.notna().all()
+            and (
+                    abs(recent_price - recent_ma200) / recent_ma200 <= TOUCH_MA200_BAND_PCT
+            ).any()
     )
-    rebound = prev_close is not None and price > prev_close
-    return_inside = pd.notna(bb_lower_now) and price >= bb_lower_now
 
-    is_value_buy = bool(is_near_200ma and prev_below_lower and rebound and return_inside)
+    # 오늘 종가가 볼린저 하단 아래로 이탈했는지 (반등 여부와 무관 — 이탈 자체가 신호)
+    broke_bb_lower = bool(pd.notna(bb_lower_now) and price < bb_lower_now)
+
+    is_value_buy = bool(near_200ma_recent and broke_bb_lower)
 
     return {
         "symbol": symbol,
@@ -1659,28 +1723,6 @@ def _attach_rs_percentile_and_gates(rows: list) -> list:
         r["entry_gate_pass_count"] = sum(1 for s in axis_scores if s is not None and s >= 70)
     return rows
 
-def load_full_krx_universe() -> pd.DataFrame:
-    """
-    스크리너 전용 — 시가총액/거래대금 유동성 필터를 걸지 않고 코스피+코스닥 전체 상장
-    종목을 로딩한다. 매매 전략용 load_filtered_universe()와 달리, 스크리너는 "이 종목이
-    왜 안 보이지"가 없어야 하므로 최소한의 비교불가 종목(ETF/ETN/스팩/우선주/6자리
-    코드가 아닌 것)만 제외하고 나머지는 전부 포함한다.
-    """
-    df = fdr.StockListing('KRX')
-
-    name = df["Name"].astype(str)
-    code = df["Code"].astype(str) if "Code" in df.columns else df["Symbol"].astype(str)
-
-    is_spac = name.str.contains(r"스팩|기업인수", regex=True, na=False)
-    is_preferred = name.str.match(r".+\d?우[A-Z]?$", na=False)   # OO우, OO우B 등 우선주
-    is_etf_etn = df.get("Market", pd.Series(dtype=str)).astype(str).str.contains("ETF|ETN", na=False)
-    is_valid_code = code.str.len() == 6
-
-    keep = is_valid_code & ~(is_spac | is_preferred | is_etf_etn)
-    df = df[keep].copy()
-    df = df.rename(columns={"Code": "Symbol"}) if "Code" in df.columns else df
-
-    return df[["Symbol", "Name", "Market"]].reset_index(drop=True)
 
 def save_trend_stats_rows(supabase, rows: list) -> int:
     """계산이 끝난 rows를 stock_trend_stats에 upsert만 하는 저장 전용 함수.
@@ -1700,3 +1742,138 @@ def save_trend_stats_rows(supabase, rows: list) -> int:
         print(f"  [x] stock_trend_stats 저장 실패: {e}")
         return 0
     return len(rows)
+
+def fetch_all_rows(query_builder, page_size: int = 1000, max_retries: int = 4):
+    """Supabase REST 기본 1000행 제한 대응 페이지네이션 + 일시적 커넥션 종료 재시도.
+    main.py와 배치 양쪽에서 공유해서 쓰는 공통 유틸."""
+    all_rows = []
+    start = 0
+    while True:
+        attempt = 0
+        while True:
+            try:
+                res = query_builder.range(start, start + page_size - 1).execute()
+                break
+            except Exception:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                time.sleep((0.4 * (2 ** (attempt - 1))) + random.uniform(0, 0.3))
+        rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return all_rows
+
+
+def _calc_yoy(cur, prev) -> float | None:
+    if cur is None or prev is None or prev == 0:
+        return None
+    return (cur - prev) / abs(prev) * 100
+
+
+def _find_same_quarter_last_year(rows_desc: list, latest: dict) -> dict | None:
+    """latest와 같은 분기(quarter)의 전년도(bsns_year - 1) row를 찾는다.
+    rows_desc는 bsns_year desc, quarter desc로 이미 정렬돼 있음 (fetch_all_rows 정렬 그대로)."""
+    target_year = latest["bsns_year"] - 1
+    target_quarter = latest["quarter"]
+    for r in rows_desc:
+        if r["bsns_year"] == target_year and r["quarter"] == target_quarter:
+            return r
+    return None
+
+
+def build_screener_snapshot(supabase, log_fn=print) -> int:
+    """
+    stock_trend_stats(미너비니 기술지표) + stock_sector(업종) + stock_fundamental_quarterly
+    (분기재무, YoY 계산 포함)를 미리 조인/계산해서 stock_screener_snapshot에 통째로 저장한다.
+    배치(quant_cron.run_batch)에서 트렌드 지표 갱신 직후 호출 — 실시간 API 요청 시점에는
+    더 이상 이 무거운 조인/계산을 하지 않고 이 테이블만 읽으면 된다.
+    """
+    trend_rows = fetch_all_rows(supabase.table(TBL_TREND).select("*"))
+    if not trend_rows:
+        log_fn("  [x] stock_trend_stats가 비어있어 스크리너 스냅샷 빌드를 건너뜁니다.")
+        return 0
+
+    sector_rows = fetch_all_rows(supabase.table(TBL_SECTOR).select("symbol,sector"))
+    sector_by_symbol = {r["symbol"]: r.get("sector") for r in sector_rows}
+
+    fundamentals = fetch_all_rows(
+        supabase.table(TBL_FUNDA_QUARTERLY)
+        .select("symbol,bsns_year,quarter,revenue_q,op_profit_q,net_income_q,"
+                 "eps_q,roe,debt_ratio,current_ratio,interest_coverage")
+        .order("bsns_year", desc=True)
+        .order("quarter", desc=True)
+    )
+    fund_rows_by_symbol = {}
+    for row in fundamentals:
+        fund_rows_by_symbol.setdefault(row["symbol"], []).append(row)
+
+    regime_cache = load_market_regime_cache(supabase)
+    is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
+
+    ts = now_kst_str()
+    snapshot_rows = []
+    for row in trend_rows:
+        symbol = row["symbol"]
+        row = dict(row)
+        row.pop("updated_at", None)  # 트렌드 테이블의 updated_at은 버리고 이 배치 시각으로 통일
+        row["sector"] = sector_by_symbol.get(symbol) or "Unknown"
+
+        rows_desc = fund_rows_by_symbol.get(symbol, [])
+        latest = rows_desc[0] if rows_desc else {}
+
+        row["revenue_q"] = latest.get("revenue_q")
+        row["op_profit_q"] = latest.get("op_profit_q")
+        row["net_income_q"] = latest.get("net_income_q")
+        row["eps_q"] = latest.get("eps_q")
+        row["roe"] = latest.get("roe")
+        row["debt_ratio"] = latest.get("debt_ratio")
+        row["current_ratio"] = latest.get("current_ratio")
+        row["interest_coverage"] = latest.get("interest_coverage")
+        rev, op = latest.get("revenue_q"), latest.get("op_profit_q")
+        row["op_margin"] = round(op / rev * 100, 2) if rev not in (None, 0) and op is not None else None
+
+        # 성장주 판정: 같은 분기 전년도(YoY) 대비 매출/이익 성장률 (QoQ 아님 — 계절성 왜곡 방지)
+        prev_year_q = _find_same_quarter_last_year(rows_desc, latest) if latest else None
+        revenue_yoy = _calc_yoy(latest.get("revenue_q"), prev_year_q.get("revenue_q")) if prev_year_q else None
+        op_profit_yoy = _calc_yoy(latest.get("op_profit_q"), prev_year_q.get("op_profit_q")) if prev_year_q else None
+        net_income_yoy = _calc_yoy(latest.get("net_income_q"), prev_year_q.get("net_income_q")) if prev_year_q else None
+
+        row["revenue_yoy"] = round(revenue_yoy, 2) if revenue_yoy is not None else None
+        row["op_profit_yoy"] = round(op_profit_yoy, 2) if op_profit_yoy is not None else None
+        row["net_income_yoy"] = round(net_income_yoy, 2) if net_income_yoy is not None else None
+
+        is_growth_stock = bool(
+            revenue_yoy is not None and revenue_yoy >= GROWTH_YOY_MIN_PCT
+            and (
+                (op_profit_yoy is not None and op_profit_yoy >= GROWTH_YOY_MIN_PCT)
+                or (net_income_yoy is not None and net_income_yoy >= GROWTH_YOY_MIN_PCT)
+            )
+        )
+        row["is_growth_stock"] = is_growth_stock
+        row["is_growth_value_buy"] = bool(row.get("is_value_buy") and is_growth_stock)
+        row["is_second_buy_regime"] = is_2nd_buy_regime
+        row["updated_at"] = ts
+
+        snapshot_rows.append(row)
+
+    try:
+        current_symbols = {r["symbol"] for r in snapshot_rows}
+        for i in range(0, len(snapshot_rows), 500):
+            supabase.table(TBL_SCREENER_SNAPSHOT).upsert(
+                snapshot_rows[i:i + 500], on_conflict="symbol"
+            ).execute()
+        # stock_trend_stats에서 빠진(상장폐지 등) 종목은 스냅샷에서도 정리
+        existing = fetch_all_rows(supabase.table(TBL_SCREENER_SNAPSHOT).select("symbol"))
+        stale_symbols = [r["symbol"] for r in existing if r["symbol"] not in current_symbols]
+        if stale_symbols:
+            for i in range(0, len(stale_symbols), 500):
+                supabase.table(TBL_SCREENER_SNAPSHOT).delete().in_("symbol", stale_symbols[i:i + 500]).execute()
+            log_fn(f"  [✓] 스크리너 스냅샷: 상장폐지 등으로 빠진 {len(stale_symbols)}종목 정리")
+        log_fn(f"  [✓] 스크리너 스냅샷(stock_screener_snapshot) 갱신 완료 ({len(snapshot_rows)}종목)")
+    except Exception as e:
+        log_fn(f"  [x] 스크리너 스냅샷 저장 실패: {e}")
+        return 0
+    return len(snapshot_rows)
