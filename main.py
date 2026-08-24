@@ -609,7 +609,7 @@ def get_backtesting_result(refresh: str = "false"):
 
 # 🌟 배치가 하루 한 번(14:30)만 갱신하는 데이터이므로, 캐시 TTL을 그에 맞춰 넉넉히 잡아도 됨.
 #    프론트에서 새로고침 버튼 누르면 refresh=true로 캐시를 비우고 다시 읽음.
-SCREENER_CACHE_TTL = 3600
+SCREENER_CACHE_TTL = 0
 screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
 
 @app.get("/api/screener")
