@@ -586,23 +586,22 @@ def get_macro_dashboard():
     except Exception as e:
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
-
-BACKTEST_CACHE_ID = 14
-
 backtest_result_cache = TTLCache(maxsize=1, ttl=300)  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
 
-@app.get("/api/backtesting/result")
+BACKTEST_12Y_CACHE_ID = 16  # quant_backtest_12y.py의 TBL_BACKTEST_12Y_CACHE_ID와 동일해야 함
+
+@app.get("/api/backtesting/12y-result")
 @cached(cache=backtest_result_cache)
-def get_backtesting_result(refresh: str = "false"):
+def get_backtesting_12y_result(refresh: str = "false"):
     if refresh.lower() == "true":
         backtest_result_cache.clear()
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
     try:
-        res = supabase.table("quant_screening_cache").select("results").eq("id", BACKTEST_CACHE_ID).execute()
+        res = supabase.table("quant_screening_cache").select("results").eq("id", BACKTEST_12Y_CACHE_ID).execute()
         if res.data and res.data[0].get("results"):
             return {"status": "success", "data": json.loads(res.data[0]["results"])}
-        return {"status": "success", "data": []}
+        return {"status": "success", "data": None}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
