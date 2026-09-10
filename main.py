@@ -3,6 +3,7 @@ import json
 import random
 import threading
 import time
+import math
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -179,7 +180,7 @@ def _fetch_all_quant():
     if r1.data:
         for row in r1.data:
             try:
-                res_json = json.loads(row["results"])
+                res_json = _sanitize_nan(json.loads(row["results"]))
                 if row["id"] == 11: data["holdings"] = res_json
                 elif row["id"] == 12: data["trades"] = res_json
                 elif row["id"] == 13: data["history"] = res_json
@@ -634,6 +635,16 @@ def get_screener_data(refresh: str = "false"):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+def _sanitize_nan(obj):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nan(v) for v in obj]
+    return obj
 # ==============================================================================
 # 📈 [신규] 순수 DB 기반 차트 & 이동평균선 전용 API
 # ==============================================================================
