@@ -825,7 +825,8 @@ for hour, minute in BATCH_WARMUP_TIMES:
 
 @app.on_event("startup")
 def start_scheduler():
-    if supabase: _warmup_all()
+    if supabase:
+        threading.Thread(target=_warmup_all, daemon=True).start()
     scheduler.start()
 
 @app.on_event("shutdown")
