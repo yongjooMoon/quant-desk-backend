@@ -246,10 +246,11 @@ def get_news(offset: int = 0, limit: int = 50, major_only: bool = False, refresh
             full = news_smart_cache.data or []
 
         if major_only:
-            # market_news.created_at은 타임존 정보 없는 KST 벽시계 시각 문자열로 저장되어 있다
-            # (주식/sync_news_to_supabase.py가 naive datetime.isoformat()으로 기록, 프론트의
-            # parseDBTime도 이걸 그대로 로컬 시각으로 파싱함) — 그래서 astimezone 변환 없이
-            # 앞 10자리(YYYY-MM-DD) 문자열 비교만으로 "오늘(KST)"을 판정한다.
+            # market_news.created_at은 실제로는 "+00:00"이 붙어서 내려온다(주식/sync_news_to_supabase.py가
+            # naive datetime.isoformat()으로 기록한 걸 Postgres timestamptz가 UTC로 라벨링해서 저장).
+            # 하지만 그 naive 값 자체가 이미 KST 벽시계 시각으로 채워진 것이고, 프론트의 parseDBTime도
+            # +00:00을 무시한 채 앞자리 숫자를 그대로 로컬(KST) 시각으로 읽는 관례가 이미 있다 — 그래서
+            # 여기서도 astimezone 변환 없이 앞 10자리(YYYY-MM-DD)만 그 관례대로 비교해 "오늘(KST)"을 판정한다.
             today_kst_str = datetime.now(KST).date().isoformat()
             page = [n for n in full if n.get("is_major") and (n.get("created_at") or "")[:10] == today_kst_str]
             return {"status": "success", "data": page, "total": len(page), "has_more": False}
