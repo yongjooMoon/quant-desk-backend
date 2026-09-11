@@ -31,6 +31,7 @@ from quant_core import (
     load_fundamental_from_db, save_fundamental_to_db,
     evaluate_entry_gates, get_index_return_pct, load_filtered_universe, load_market_regime_cache,
     fetch_all_rows,   # ← 추가 (quant_core로 옮긴 공통 유틸 재사용)
+    load_full_krx_universe,  # /api/krx-list가 호출하지만 import가 빠져 있어 NameError로 죽어있던 것 수정
 )
 from real_estate import generate_excel_data
 
