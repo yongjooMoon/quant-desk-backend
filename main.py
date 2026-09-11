@@ -148,6 +148,10 @@ funda_cache = TTLCache(maxsize=3000, ttl=50)
 #    다시 호출하지 않도록 짧은 TTL로 캐싱 (배치와 동일한 get_index_return_pct 사용)
 index_return_cache = TTLCache(maxsize=2, ttl=600)
 
+# 뉴스 무한스크롤 캐시 상한 — 이 이상 과거로 스크롤하면 더 못 불러온다(총량이 몇 주~몇 달치인
+# 뉴스 피드에서 3000개는 사실상 도달하기 어려운 한도라 실용적 상한으로 채택).
+NEWS_CACHE_CAP = 3000
+
 def _get_latest_news_ts():
     res = supabase.table("market_news").select("created_at").order("created_at", desc=True).limit(1).execute()
     if res.data: return res.data[0]["created_at"]
@@ -157,7 +161,7 @@ def _fetch_all_news(limit: int = 500):
     res = supabase.table("market_news").select("*").order("created_at", desc=True).limit(limit).execute()
     return res.data
 
-def refresh_news_cache(limit: int = 500):
+def refresh_news_cache(limit: int = NEWS_CACHE_CAP):
     if not supabase: return
     try:
         latest_ts = _get_latest_news_ts()
@@ -217,22 +221,48 @@ def decrypt_text(encrypted_text: str) -> str:
         return encrypted_text
 
 @app.get("/api/news")
-def get_news(limit: int = 500, refresh: str = "false"):
+def get_news(offset: int = 0, limit: int = 50, major_only: bool = False, refresh: str = "false"):
+    """
+    offset/limit: 무한스크롤 페이지네이션 (NewsDesk.jsx 세로 리스트).
+    major_only=true: 오늘(KST) is_major 뉴스만 — 히어로 레일 전용, offset/limit 무시.
+    캐시 구조: news_smart_cache.data는 "최신순 상위 N개"를 통째로 들고 있는 인메모리
+    캐시(최대 NEWS_CACHE_CAP개)이고, 매 요청은 여기서 파이썬 슬라이싱만 한다 — 페이지마다
+    Supabase를 새로 때리지 않고, 캐시가 이번 페이지를 못 채울 때만 더 크게 다시 채운다.
+    """
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     try:
         if refresh.lower() == "true":
-            refresh_news_cache(limit)
+            refresh_news_cache(NEWS_CACHE_CAP)
+        else:
+            latest_ts = _get_latest_news_ts()
             with news_smart_cache.lock:
-                return {"status": "success", "data": news_smart_cache.data, "cached": False}
-        latest_ts = _get_latest_news_ts()
+                cache_fresh = news_smart_cache.data is not None and news_smart_cache.last_ts == latest_ts
+                cache_covers_page = cache_fresh and len(news_smart_cache.data) >= offset + limit
+            if not cache_covers_page:
+                needed = min(max(offset + limit, 500), NEWS_CACHE_CAP)
+                refresh_news_cache(needed)
+
         with news_smart_cache.lock:
-            if news_smart_cache.data is not None and news_smart_cache.last_ts == latest_ts:
-                return {"status": "success", "data": news_smart_cache.data, "cached": True}
-        data = _fetch_all_news(limit)
-        with news_smart_cache.lock:
-            news_smart_cache.data = data
-            news_smart_cache.last_ts = latest_ts
-        return {"status": "success", "data": data, "cached": False}
+            full = news_smart_cache.data or []
+
+        if major_only:
+            # market_news.created_at은 타임존 정보 없는 KST 벽시계 시각 문자열로 저장되어 있다
+            # (주식/sync_news_to_supabase.py가 naive datetime.isoformat()으로 기록, 프론트의
+            # parseDBTime도 이걸 그대로 로컬 시각으로 파싱함) — 그래서 astimezone 변환 없이
+            # 앞 10자리(YYYY-MM-DD) 문자열 비교만으로 "오늘(KST)"을 판정한다.
+            today_kst_str = datetime.now(KST).date().isoformat()
+            page = [n for n in full if n.get("is_major") and (n.get("created_at") or "")[:10] == today_kst_str]
+            return {"status": "success", "data": page, "total": len(page), "has_more": False}
+
+        page = full[offset: offset + limit]
+        return {
+            "status": "success",
+            "data": page,
+            "total": len(full),
+            "has_more": (offset + limit) < len(full),
+            "offset": offset,
+            "limit": limit,
+        }
     except Exception as e: return {"status": "error", "message": str(e)}
 
 
