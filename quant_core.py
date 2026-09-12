@@ -85,18 +85,24 @@ DART_ACCOUNT_ID_MAP = {
 # [규모 1] 시장 레짐(국면) 파라미터
 # ══════════════════════════════════════════
 # 레짐별 ATR 트레일링 배수 — 강세장은 넉넉히 태우고, 약세장은 바짝 조임
-REGIME_ATR_MULT = {"BULL": 3.0, "NEUTRAL": 2.5, "BEAR": 1.5}
-# 레짐별 초기 손절 상한(%) — 약세장은 최대 손실폭 자체를 줄임
-REGIME_RISK_CAP = {"BULL": 0.15, "NEUTRAL": 0.15, "BEAR": 0.10}
+# [2026-09-12] 12년 백테스트 + 워크포워드 검증(전반부/후반부 둘 다 PF>1 확인) 결과,
+# 기존 값(3.0/2.5/1.5)은 손절이 너무 타이트해서 승자를 조기 청산 -> 원래값의 3.5배로 재보정.
+# 검증 결과: PF 0.41(원본) -> 1.19, MDD -95.32% -> -13.27%, CAGR -22.01% -> +1.41%
+# (전반부 2014-2020 PF 1.11 / 후반부 2020-2026 PF 1.22 — 코로나 이전/이후 둘 다 확인됨)
+# 주식/quant_core.py와 동일하게 반영(단일 소스 원칙 유지).
+REGIME_ATR_MULT = {"BULL": 10.5, "NEUTRAL": 8.75, "BEAR": 5.25}
+# 레짐별 초기 손절 상한(%) — 약세장은 최대 손실폭 자체를 줄임 [2026-09-12] 원래값의 2.5배로 재보정(위와 동일 검증)
+REGIME_RISK_CAP = {"BULL": 0.375, "NEUTRAL": 0.375, "BEAR": 0.25}
 # 레짐별 워치리스트 진입 문턱 — 약세장엔 더 깐깐하게
 REGIME_WATCHLIST_MIN = {"BULL": WATCHLIST_FILTER_MIN, "NEUTRAL": WATCHLIST_FILTER_MIN, "BEAR": WATCHLIST_FILTER_MIN + 1}
 
 # ══════════════════════════════════════════
 # [순위 2] 이익 보호(Profit Protection) 파라미터 — 고정 40% 익절 폐지
 # ══════════════════════════════════════════
-PROFIT_LOCK_TRIGGER_PCT     = 15.0  # 수익률이 이 값을 넘으면 "이익 보호 모드" 진입
-PROFIT_LOCK_ATR_MULT_FACTOR = 0.6   # 보호 모드에서 트레일링 ATR 배수를 좁히는 비율 (더 타이트하게 추종)
+PROFIT_LOCK_TRIGGER_PCT     = 70.0  # 수익률이 이 값을 넘으면 "이익 보호 모드" 진입 [2026-09-12] 15->70, 워크포워드 검증 완료(REGIME_ATR_MULT 주석 참고)
+PROFIT_LOCK_ATR_MULT_FACTOR = 1.0   # 보호 모드에서 트레일링 ATR 배수를 좁히는 비율 [2026-09-12] 0.6->1.0(안 좁힘). 이 로직이 승자를 조기청산하는 주범으로 확인됨
 VOL_COOLING_RATIO           = 0.8   # 최근 5일 거래량이 20일 평균의 이 비율 밑으로 식으면 "모멘텀 소진" 후보
+MOMENTUM_MA_WINDOW          = 10    # "모멘텀 소진" 판정에 쓰는 단기 이평선 기간(일) — 이 선 밑으로 빠지면 후보
 
 # ══════════════════════════════════════════
 # [순위 3] 추세 붕괴(Trend Breakdown) 조기화 — 3중 AND(만장일치) 완화
@@ -575,7 +581,8 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
     metrics["growth_composite"] = (metrics["net_yoy"] * 0.5) + (op_yoy * 0.3) + (rev_yoy * 0.2)
 
     if len(df) < 60:
-        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","supply_demand","rs_60d","dynamic_overext_limit_pct"]}
+        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","supply_demand","rs_60d","dynamic_overext_limit_pct",
+                                "ma50","ma150","ma200","ma200_1m_ago","ma200_3m_ago","w52_high","w52_low"]}
 
     # 2. Dynamic MDD (ATR 기반 생존 방어선)
     roll_max = close.tail(60).cummax()
@@ -616,16 +623,60 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
     else:
         metrics["rs_60d"] = 0.0
 
+    # 9. [신규] 미너비니 트렌드 템플릿용 지표 — evaluate_gates(trend_mode="minervini")에서만 사용.
+    # compute_trend_stats_from_closes()와 동일 정의(50/150/200일 정배열, 200일선 1/3개월 추세,
+    # 52주 고점/저점). TREND_MIN_BARS(264일) 미만이면 판정 불가로 보고 0 처리(추세 미충족으로 간주).
+    if len(close) >= TREND_MIN_BARS:
+        ma200_series = close.rolling(200).mean()
+        metrics["ma50"] = float(close.rolling(50).mean().iloc[-1])
+        metrics["ma150"] = float(close.rolling(150).mean().iloc[-1])
+        metrics["ma200"] = float(ma200_series.iloc[-1])
+        metrics["ma200_1m_ago"] = float(ma200_series.iloc[-1 - 21])
+        metrics["ma200_3m_ago"] = float(ma200_series.iloc[-1 - 63])
+        recent_252 = close.iloc[-252:]
+        metrics["w52_high"] = float(recent_252.max())
+        metrics["w52_low"] = float(recent_252.min())
+    else:
+        metrics["ma50"] = metrics["ma150"] = metrics["ma200"] = 0.0
+        metrics["ma200_1m_ago"] = metrics["ma200_3m_ago"] = 0.0
+        metrics["w52_high"] = metrics["w52_low"] = 0.0
+
     return metrics
 
-def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vol: float) -> dict:
+def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vol: float,
+                    trend_mode: str = "minervini") -> dict:
     """6대 매수 관문(성장/MDD/유동성/추세/돌파/수급) 판정 — 이 시스템의 유일한 판정 로직.
-    run_screening_from_db, evaluate_entry_gates, quant_backTesting.strategy_filters가 전부 이걸 호출한다."""
+    run_screening_from_db, evaluate_entry_gates, quant_backTesting.strategy_filters가 전부 이걸 호출한다.
+
+    trend_mode="minervini"(기본값, [2026-09-12]부터 — 아래 검증 후 legacy에서 교체): 미너비니
+    트렌드 템플릿(compute_trend_stats_from_closes와 동일 정의: 50>150>200일 정배열, 200일선
+    1개월+3개월 연속 상승, 52주 고점 25% 이내, 52주 저점 대비 30% 이상 상승) 적용.
+    calc_quant_metrics()가 채워주는 ma50/ma150/ma200/ma200_1m_ago/ma200_3m_ago/w52_high/
+    w52_low가 필요 — 없거나 0이면(데이터 부족) 추세 미충족으로 처리한다.
+    trend_mode="legacy": 이전 방식(price>20MA>60MA만 확인하는 단기 추세 체크). 12년 백테스트로
+    비교 검증한 결과 legacy는 PF 0.41(적자), minervini+재보정 파라미터는 PF 1.19(전반부/후반부
+    둘 다 1 이상)로 확인되어 기본값을 교체함 — 되돌리려면 trend_mode="legacy"를 명시하면 된다."""
     f_growth = bool(metrics["growth_composite"] > 0)
     f_mdd = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
     f_liq = bool(metrics["liquidity_20d"] >= 50)
-    f_trend = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"])
-                   and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+
+    if trend_mode == "minervini":
+        ma50, ma150, ma200 = metrics.get("ma50", 0), metrics.get("ma150", 0), metrics.get("ma200", 0)
+        ma200_1m, ma200_3m = metrics.get("ma200_1m_ago", 0), metrics.get("ma200_3m_ago", 0)
+        w52_high, w52_low = metrics.get("w52_high", 0), metrics.get("w52_low", 0)
+        has_data = ma200 > 0 and ma200_1m > 0 and ma200_3m > 0 and w52_high > 0 and w52_low > 0
+        is_aligned = has_data and curr_price > ma50 > ma150 > ma200
+        is_ma200_trending = has_data and ma200 > ma200_1m and ma200 > ma200_3m
+        near_52w_high = has_data and ((w52_high - curr_price) / w52_high * 100) <= 25
+        above_52w_low = has_data and ((curr_price - w52_low) / w52_low * 100) >= 30
+        f_trend = bool(has_data and is_aligned and is_ma200_trending and near_52w_high and above_52w_low)
+        trend_reason = (f"정배열(50>150>200MA) {is_aligned} · 200MA 1/3개월 상승 {is_ma200_trending} · "
+                        f"52주고점대비 {((w52_high - curr_price) / w52_high * 100):.1f}% · "
+                        f"52주저점대비 {((curr_price - w52_low) / w52_low * 100):+.1f}%") if has_data else "데이터 부족(264일 미만)"
+    else:
+        f_trend = bool((curr_price > metrics["ma20"]) and (metrics["ma20"] > metrics["ma60"])
+                       and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
+        trend_reason = f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"
 
     breakout_threshold = metrics["high_60d"] * 0.90
     f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
@@ -646,8 +697,7 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
         "mdd": {"pass": f_mdd, "label": "Dynamic MDD",
                 "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
         "liq": {"pass": f_liq, "label": "Liquidity", "reason": f"{metrics['liquidity_20d']:.0f}억"},
-        "trend": {"pass": f_trend, "label": "Trend Alignment",
-                  "reason": f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"},
+        "trend": {"pass": f_trend, "label": "Trend Alignment", "reason": trend_reason},
         "break": {"pass": f_break, "label": "Price Breakout",
                   "reason": (f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1
                              else f"고점대비 {(curr_price / high_60d_val) * 100:.1f}% (2일 연속 돌파권)")},
@@ -967,7 +1017,7 @@ def evaluate_exit_signal(entry_price: float, entry_date, df: pd.DataFrame, regim
     trailing_stop = (highest_close - effective_atr_mult * atr20) if pd.notna(atr20) else initial_stop
     current_stop = max(initial_stop, trailing_stop)
 
-    ma10 = close.iloc[-10:].mean()
+    ma_momentum = close.iloc[-MOMENTUM_MA_WINDOW:].mean()
     ma20 = close.iloc[-20:].mean()
 
     # [수정] 50일선 계산 추가 (데이터 부족시 20일선으로 대체)
@@ -981,7 +1031,7 @@ def evaluate_exit_signal(entry_price: float, entry_date, df: pd.DataFrame, regim
     trend_break_score = 3 if trend_broken else 0
 
     vol_5d, vol_20d = vol.iloc[-5:].mean(), vol.iloc[-20:].mean()
-    momentum_exhausted = profit_locking and (vol_5d < vol_20d * VOL_COOLING_RATIO) and (curr_price < ma10)
+    momentum_exhausted = profit_locking and (vol_5d < vol_20d * VOL_COOLING_RATIO) and (curr_price < ma_momentum)
 
     should_sell, reason = False, ""
     if curr_price <= current_stop:
