@@ -222,10 +222,13 @@ def decrypt_text(encrypted_text: str) -> str:
         return encrypted_text
 
 @app.get("/api/news")
-def get_news(offset: int = 0, limit: int = 50, major_only: bool = False, refresh: str = "false"):
+def get_news(offset: int = 0, limit: int = 50, major_only: bool = False, today_only: bool = False, refresh: str = "false"):
     """
     offset/limit: 무한스크롤 페이지네이션 (NewsDesk.jsx 세로 리스트).
     major_only=true: 오늘(KST) is_major 뉴스만 — 히어로 레일 전용, offset/limit 무시.
+    today_only=true: is_major 여부와 무관하게 오늘(KST) 수집된 전체 건수만 — NewsDesk
+    히어로 밴드의 "금일 수집" 통계 전용. 기사 본문은 필요 없으므로 data는 빈 배열로
+    돌려주고 total만 본다(캐시가 이미 최신순 상위 N개를 들고 있어 별도 쿼리 없음).
     캐시 구조: news_smart_cache.data는 "최신순 상위 N개"를 통째로 들고 있는 인메모리
     캐시(최대 NEWS_CACHE_CAP개)이고, 매 요청은 여기서 파이썬 슬라이싱만 한다 — 페이지마다
     Supabase를 새로 때리지 않고, 캐시가 이번 페이지를 못 채울 때만 더 크게 다시 채운다.
@@ -255,6 +258,11 @@ def get_news(offset: int = 0, limit: int = 50, major_only: bool = False, refresh
             today_kst_str = datetime.now(KST).date().isoformat()
             page = [n for n in full if n.get("is_major") and (n.get("created_at") or "")[:10] == today_kst_str]
             return {"status": "success", "data": page, "total": len(page), "has_more": False}
+
+        if today_only:
+            today_kst_str = datetime.now(KST).date().isoformat()
+            count = sum(1 for n in full if (n.get("created_at") or "")[:10] == today_kst_str)
+            return {"status": "success", "data": [], "total": count, "has_more": False}
 
         page = full[offset: offset + limit]
         return {
