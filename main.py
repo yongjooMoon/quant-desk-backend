@@ -673,10 +673,8 @@ def get_screener_data(refresh: str = "false"):
         # 없애기 위해 가벼운 단일 행 조회로 최신값을 덮어씀 (비용 거의 없음)
         regime_cache = load_market_regime_cache(supabase)
         is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
-        market_regime = regime_cache.get("regime", "NEUTRAL")
         for row in results:
             row["is_second_buy_regime"] = is_2nd_buy_regime
-            row["market_regime"] = market_regime
 
         return {"status": "success", "data": results}
     except Exception as e:
