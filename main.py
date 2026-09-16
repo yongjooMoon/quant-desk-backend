@@ -4,6 +4,8 @@ import random
 import threading
 import time
 import math
+import gc
+import ctypes
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -143,7 +145,10 @@ news_smart_cache = SmartCache()
 quant_smart_cache = SmartCache()
 
 krx_cache = TTLCache(maxsize=5, ttl=86400)
-funda_cache = TTLCache(maxsize=3000, ttl=50)
+# [2026-09-17] OOM 대응: maxsize=3000은 실사용 대비 과도하게 큰 상한이었다(50초 안에
+# 3000개 서로 다른 종목이 조회될 일은 사실상 없음) — 캐시 자체가 무제한처럼 동작해
+# 메모리 상한 역할을 못 하고 있었다. 실사용 패턴에 맞춰 상한/TTL을 축소.
+funda_cache = TTLCache(maxsize=200, ttl=30)
 
 # 🧪 [추가] 시장 지수(KOSPI/KOSDAQ) 60일 수익률(RS 벤치마크) 캐시 — 종목 검색마다 fdr을
 #    다시 호출하지 않도록 짧은 TTL로 캐싱 (배치와 동일한 get_index_return_pct 사용)
@@ -801,6 +806,22 @@ def download_realestate():
 scheduler = BackgroundScheduler(timezone=KST)
 BATCH_WARMUP_TIMES = [(8, 10), (14, 40), (16, 40), (23, 40)]
 
+# [2026-09-17] Render 무료 티어(512MB) OOM 재시작 대응.
+# Render API로 메모리 그래프를 직접 확인한 결과, 요청이 쌓일수록(특히 /api/search/{symbol}가
+# 매 요청마다 pandas DataFrame을 만들었다 버리는 패턴) 프로세스 RSS가 10~20분 만에
+# 450~500MB까지 계단식으로만 올라가고 절대 안 내려갔다 — glibc malloc이 한번 확보한 arena를
+# 파이썬 가비지 컬렉션 이후에도 OS에 안 돌려주는 잘 알려진 현상(진짜 객체 누수가 아니라
+# "free는 됐는데 OS엔 안 돌려준" 상태). malloc_trim(0)을 주기적으로 강제 호출해 실제로
+# 회수시킨다. Linux(Render 컨테이너) 전용 API라 그 외 환경(로컬 Windows/Mac 개발)에서는
+# 조용히 스킵한다.
+def _malloc_trim():
+    try:
+        gc.collect()
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Linux glibc가 아닌 환경(Windows 로컬 개발 등) — 조용히 무시
+
 # ==============================================================================
 # 🏢 6. 청약 분양 아파트 캘린더 조회
 # ==============================================================================
@@ -873,6 +894,10 @@ def _warmup_all():
 
 for hour, minute in BATCH_WARMUP_TIMES:
     scheduler.add_job(_warmup_all, "cron", hour=hour, minute=minute)
+
+# 메모리가 512MB 한도까지 올라가는 데 실측상 10~20분 걸렸으므로, 그보다 훨씬 짧은
+# 주기로 돌려야 한도 도달 전에 회수할 기회가 여러 번 생긴다.
+scheduler.add_job(_malloc_trim, "interval", minutes=3)
 
 @app.on_event("startup")
 def start_scheduler():
