@@ -89,10 +89,19 @@ DART_ACCOUNT_ID_MAP = {
 # 기존 값(3.0/2.5/1.5)은 손절이 너무 타이트해서 승자를 조기 청산 -> 원래값의 3.5배로 재보정.
 # 검증 결과: PF 0.41(원본) -> 1.19, MDD -95.32% -> -13.27%, CAGR -22.01% -> +1.41%
 # (전반부 2014-2020 PF 1.11 / 후반부 2020-2026 PF 1.22 — 코로나 이전/이후 둘 다 확인됨)
+# [2026-09-12 재정리, 2026-09-17 backend 동기화] 레짐별 3분화가 실제로 자유도를 정당화하는지
+# sweep_backtest_params.py로 검사한 결과, BULL값(10.5)을 세 레짐 모두에 flat 적용해도 3분화
+# 버전과 동일(CAGR 16.13 vs 16.12, MDD -26.75% 동일) — NEUTRAL/BEAR는 REGIME_RISK_CAP이 이미
+# 더 타이트한 제약으로 작동해 ATR_MULT 값 자체가 거의 발동을 안 함. "3개의 독립 파라미터"처럼
+# 보였지만 실질은 "전부 넉넉하게" 하나만 있으면 충분했다는 뜻이라 불필요한 자유도 제거.
 # 주식/quant_core.py와 동일하게 반영(단일 소스 원칙 유지).
-REGIME_ATR_MULT = {"BULL": 10.5, "NEUTRAL": 8.75, "BEAR": 5.25}
+REGIME_ATR_MULT = {"BULL": 10.5, "NEUTRAL": 10.5, "BEAR": 10.5}
 # 레짐별 초기 손절 상한(%) — 약세장은 최대 손실폭 자체를 줄임 [2026-09-12] 원래값의 2.5배로 재보정(위와 동일 검증)
-REGIME_RISK_CAP = {"BULL": 0.375, "NEUTRAL": 0.375, "BEAR": 0.25}
+# [2026-09-12 재정리, 2026-09-17 backend 동기화] BEAR는 신규매수 자체가 evaluate_gates 진입
+# 전에 막혀 있어 이 값이 기존 보유 종목 손절폭에만 영향을 주는데, 0.375로 통일해도 성능이
+# 그대로(근소 우위) — 반대로 전부 0.25(BEAR값)로 내리면 CAGR 16.12->14.82, MDD도 오히려
+# -26.75%->-27.72%로 악화(타이트한 손절이 MDD를 키운다는 이번 세션 핵심 발견 재확인).
+REGIME_RISK_CAP = {"BULL": 0.375, "NEUTRAL": 0.375, "BEAR": 0.375}
 # 레짐별 워치리스트 진입 문턱 — 약세장엔 더 깐깐하게
 REGIME_WATCHLIST_MIN = {"BULL": WATCHLIST_FILTER_MIN, "NEUTRAL": WATCHLIST_FILTER_MIN, "BEAR": WATCHLIST_FILTER_MIN + 1}
 
