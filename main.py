@@ -848,6 +848,45 @@ def get_market_targets(symbol: str):
             return {"status": "none", "message": "목표가를 가져오지 못했습니다 (잠시 후 다시 시도됩니다)"}
 
 
+news_stock_cache = TTLCache(maxsize=500, ttl=300)
+_NAME_OK = re.compile(r"[^0-9A-Za-z가-힣 &.\-]")
+
+
+@app.get("/api/market/news/{symbol}")
+def get_market_news(symbol: str, name: str = ""):
+    """Related news: market_news rows whose title or sector_asset mentions the stock name (name comes from the client; sanitized)."""
+    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
+    nm = _NAME_OK.sub("", name).strip()[:30]
+    if len(nm) < 2: return {"status": "success", "data": []}
+    try:
+        ck = f"{symbol}:{nm}"
+        if ck in news_stock_cache: return {"status": "success", "data": news_stock_cache[ck]}
+        r = supabase.table("market_news").select("id,title,summary,region,created_at,is_major").or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(12).execute()
+        out = [{"id": x["id"], "title": x["title"], "summary": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", x.get("summary") or "")).strip()[:140],
+                "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major"))} for x in (r.data or [])]
+        news_stock_cache[ck] = out
+        return {"status": "success", "data": out}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/market/financials/{symbol}")
+def get_market_financials(symbol: str):
+    """Annual summary (stock_fundamental) + last 8 quarters (stock_fundamental_quarterly). Units: 억원 (as stored)."""
+    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
+    try:
+        f = supabase.table("stock_fundamental").select("*").eq("symbol", symbol).execute().data
+        if not f: return {"status": "none", "message": "재무 데이터가 없습니다"}
+        f = f[0]
+        q = supabase.table("stock_fundamental_quarterly").select("bsns_year,quarter,revenue_q,op_profit_q,net_income_q,eps_q,roe,debt_ratio,known_from").eq("symbol", symbol).order("bsns_year", desc=True).order("quarter", desc=True).limit(8).execute().data or []
+        keys = ["revenue_cur", "revenue_prev", "op_profit_cur", "op_profit_prev", "net_income_cur", "net_income_prev", "op_margin", "net_margin", "roe", "roa", "debt_ratio", "per", "pbr", "eps_cur", "eps_prev", "dividend_yield", "marcap_억", "sector", "updated_at"]
+        return _sanitize_nan({"status": "success", "annual": {k: f.get(k) for k in keys}, "quarters": q})
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def _sanitize_nan(obj):
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
