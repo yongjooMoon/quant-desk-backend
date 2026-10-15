@@ -529,6 +529,8 @@ def search_stock(symbol: str, t: Optional[str] = None):
             # ── 🧪 [1] 오늘 배치 스크리닝(confirmed/watchlist)에 이미 있는 종목이면
             #          그 결과(정확한 factor_score + filter_details)를 그대로 사용
             cached_screen = _find_in_screening_cache(symbol)
+            if stock_name == symbol and cached_screen and cached_screen.get("name"):   # names missing from the id-99 master list (small caps) come from the batch candidate row
+                stock_name = cached_screen["name"]
 
             # ── 🧪 [2] DB에 캐시된 펀더멘탈(배치가 DART+네이버 조합해 저장, 90일 TTL) 우선 사용
             fund = load_fundamental_from_db(supabase, symbol)
@@ -542,6 +544,8 @@ def search_stock(symbol: str, t: Optional[str] = None):
                     print(f"펀더멘탈 캐시 저장 실패({symbol}): {e}")
 
             sector = fund.get("sector", "") if fund else ""
+            if not sector and cached_screen:
+                sector = cached_screen.get("sector", "") or ""
 
             if cached_screen is not None:
                 # 배치가 이미 계산해 둔 정확한 랭킹 스코어/게이트를 그대로 사용 (중복계산 방지 + 완전 동일 로직 보장)
