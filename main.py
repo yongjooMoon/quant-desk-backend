@@ -719,6 +719,135 @@ def get_screener_data(refresh: str = "false"):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# ==============================================================================
+# 📊 [신규 2026-10-15] 증시 메뉴: 종목 목록(거래량/시총), MTS형 차트(일/주/월/년 + 이동평균), 애널리스트 목표가
+#   - 목록: 로컬 배치(주식/market_list_publish.py, 평일 15:45 종가 수집 직후)가 quant_screening_cache id 23에 올린 마지막 2거래일 값 + stock_fundamental 시총
+#   - 차트: stock_daily(약 720일) 일봉에서 주/월/년을 계산
+#   - 목표가: 네이버 모바일 JSON API(비공식). 종목을 열 때만 조회, 24시간 캐시, 실패하면 10분간 재호출 없이 "없음" (재시도 루프 없음), 요청 간 0.4초
+# ==============================================================================
+market_list_cache = TTLCache(maxsize=1, ttl=300)
+market_list_lock = threading.Lock()
+target_cache = TTLCache(maxsize=1000, ttl=86400)
+target_fail_cache = TTLCache(maxsize=1000, ttl=600)
+target_lock = threading.Lock()
+_SYMBOL_RE = re.compile(r"^\d{6}$")
+
+
+def _build_market_list():
+    r = supabase.table("quant_screening_cache").select("results").eq("id", 23).execute()
+    if not r.data:
+        raise RuntimeError("증시 목록 캐시(id 23)가 없습니다 (평일 15:45 종가 수집 이후 생성)")
+    base = json.loads(r.data[0]["results"])
+    marcap = {}
+    try:
+        for x in fetch_all_rows(supabase.table("stock_fundamental").select("symbol,marcap_억")):
+            v = x.get("marcap_억")
+            if v is not None:
+                marcap[x["symbol"]] = float(v)
+    except Exception as e:
+        print(f"[market-list] marcap join failed: {type(e).__name__}")
+    rows = []
+    for code, name, mk, close, pc, vol, amt in base["rows"]:
+        rows.append({"symbol": code, "name": name, "market": mk, "close": close, "chg_pct": (round((close / pc - 1) * 100, 2) if pc else None),
+                     "volume": vol, "amount": amt, "marcap_eok": marcap.get(code)})
+    return {"asof": base["asof"], "rows": rows}
+
+
+@app.get("/api/market/list")
+def get_market_list(market: str = "ALL", sort: str = "volume", limit: int = 100):
+    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    try:
+        with market_list_lock:
+            data = market_list_cache.get("v")
+            if data is None:
+                data = _build_market_list()
+                market_list_cache["v"] = data
+        rows = data["rows"]
+        if market.upper() in ("KOSPI", "KOSDAQ"):
+            rows = [x for x in rows if x["market"] == market.upper()]
+        key = {"volume": "volume", "amount": "amount", "marcap": "marcap_eok", "chg": "chg_pct"}.get(sort, "volume")
+        rows = sorted(rows, key=lambda x: (x[key] is None, -(x[key] or 0)))[:max(1, min(limit, 500))]
+        return _sanitize_nan({"status": "success", "asof": data["asof"], "total": len(data["rows"]), "data": rows})
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/market/chart/{symbol}")
+def get_market_chart(symbol: str, tf: str = "D"):
+    if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
+    try:
+        df = load_price_from_db(supabase, symbol)
+        if df.empty or len(df) < 2:
+            return {"status": "error", "message": "일봉 데이터가 부족합니다."}
+        last, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+        tf = tf.upper()
+        if tf in ("W", "M", "Y"):
+            key = df.index.to_period({"W": "W-FRI", "M": "M", "Y": "Y"}[tf])
+            g = df.groupby(key)
+            out = g.agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"), Close=("Close", "last"), Volume=("Volume", "sum"))
+            out.index = df.index.to_series().groupby(key).last().values
+        else:
+            out = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        for n in (20, 60, 120):
+            out[f"ma{n}"] = out["Close"].rolling(n).mean()
+        candles = [{"t": d.strftime("%Y-%m-%d"), "o": r.Open, "h": r.High, "l": r.Low, "c": r.Close, "v": r.Volume, "ma20": r.ma20, "ma60": r.ma60, "ma120": r.ma120} for d, r in zip(out.index, out.itertuples())]
+        return _sanitize_nan({"status": "success", "symbol": symbol, "tf": tf, "last": {"close": last, "prev_close": prev, "chg_pct": round((last / prev - 1) * 100, 2) if prev else None}, "candles": candles})
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def _norm_opinion(o):
+    s = str(o or "").lower().replace(" ", "")
+    if "buy" in s or "매수" in s or "비중확대" in s or "outperform" in s: return "매수"
+    if "sell" in s or "매도" in s or "비중축소" in s: return "매도"
+    if "hold" in s or "중립" in s or "neutral" in s: return "중립"
+    return str(o or "-")
+
+
+def _fetch_naver_targets(symbol):
+    import requests as _rq, statistics
+    H = {"User-Agent": "Mozilla/5.0"}
+    r = _rq.get(f"https://m.stock.naver.com/api/stock/{symbol}/integration", headers=H, timeout=8)
+    r.raise_for_status()
+    d = json.loads(r.content.decode("utf-8"))
+    ci = d.get("consensusInfo") or {}
+    mean = int(str(ci.get("priceTargetMean") or "0").replace(",", "") or 0)
+    reports = []
+    for x in (d.get("researches") or [])[:5]:
+        time.sleep(0.4)
+        try:
+            q = _rq.get(f"https://m.stock.naver.com/api/research/company/{x['id']}", headers=H, timeout=8)
+            q.raise_for_status()
+            c = json.loads(q.content.decode("utf-8"))["researchContent"]
+            goal = int(str(c.get("goalPrice") or "0").replace(",", "") or 0)
+            reports.append({"date": c.get("writeDate"), "broker": c.get("brokerName"), "opinion": _norm_opinion(c.get("opinion")), "goal": goal or None, "title": c.get("title")})
+        except Exception:
+            break      # one failure stops the remaining detail calls (no retry loop)
+    goals = [x["goal"] for x in reports if x["goal"]]
+    return {"consensus": {"mean": mean or None, "recomm": ci.get("recommMean"), "asof": ci.get("createDate")}, "reports": reports,
+            "median_recent": int(statistics.median(goals)) if goals else None, "n_recent": len(goals)}
+
+
+@app.get("/api/market/targets/{symbol}")
+def get_market_targets(symbol: str):
+    if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
+    with target_lock:
+        if symbol in target_cache: return {"status": "success", "cached": True, **target_cache[symbol]}
+        if symbol in target_fail_cache: return {"status": "none", "message": "목표가를 가져오지 못했습니다 (잠시 후 다시 시도됩니다)"}
+        try:
+            v = _fetch_naver_targets(symbol)
+            if not v["consensus"]["mean"] and not v["reports"]:
+                target_fail_cache[symbol] = True
+                return {"status": "none", "message": "이 종목의 목표가 데이터가 없습니다"}
+            target_cache[symbol] = v
+            return {"status": "success", "cached": False, **v}
+        except Exception as e:
+            target_fail_cache[symbol] = True
+            print(f"[targets] {symbol} failed: {type(e).__name__}")
+            return {"status": "none", "message": "목표가를 가져오지 못했습니다 (잠시 후 다시 시도됩니다)"}
+
+
 def _sanitize_nan(obj):
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
