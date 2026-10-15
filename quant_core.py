@@ -214,6 +214,85 @@ def get_index_return_pct(index_code: str = "KS11", period_days: int = RS_LOOKBAC
     except Exception:
         return 0.0
 
+# [2026-09-17] 주식/quant_core.py에서 이식 — 이 사본에만 없어서 FDR 캐시 지연 시(아래
+# 함수 docstring 참고) /api/krx-list 등이 재시도 없이 바로 실패하던 것을 원본과 동일하게
+# 맞춤(게이트/청산/사이징 로직은 이미 동기화되어 있었으나 이 유틸만 누락돼 있었음).
+def _fdr_stock_listing_with_retry(market: str, max_retries: int = 3, backoff_sec: float = 3.0) -> pd.DataFrame:
+    """
+    fdr.StockListing()은 내부적으로 GitHub 캐시 저장소(fdr_krx_data_cache)에서
+    당일자 CSV를 읽어오는데, 캐시 생성 배치가 지연/실패하면 404가 뜬다
+    (FinanceDataReader 저장소에도 동일 증상 이슈 보고 이력 있음 - 우리 코드 문제 아님).
+    일시적인 문제일 가능성이 높으므로 짧은 대기 후 재시도하고,
+    그래도 안 되면 pykrx(KRX 직접 크롤링, fdr 캐시와 무관)로 폴백한다.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            df = fdr.StockListing(market)
+            if df is not None and not df.empty:
+                return df
+            last_err = "빈 데이터프레임"
+        except Exception as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            time.sleep(backoff_sec * (attempt + 1))
+    print(f"  [!] fdr.StockListing('{market}') {max_retries}회 실패 ({last_err}) → pykrx 폴백 시도")
+    return _pykrx_stock_listing_fallback(market)
+
+def _pykrx_stock_listing_fallback(market: str) -> pd.DataFrame:
+    """
+    fdr 캐시 실패 시 pykrx로 동일한 형태(Symbol/Name/Market/Marcap/Close/Amount)의
+    데이터프레임을 만들어 반환. pykrx는 fdr_krx_data_cache와 완전히 별개의 경로(KRX 직접 크롤링)라
+    fdr 쪽 캐시 지연/실패와 무관하게 동작한다.
+    ⚠️ Sector/Industry는 pykrx가 기본 제공하지 않아 빈 문자열로 채움
+       → save_sector_cache()는 이번 실행만 스킵되지만, 종목의 sector는 어차피
+       개별 종목 펀더멘털 조회(fetch_naver_fundamental) 시 다시 채워지므로 치명적이지 않음.
+    """
+    try:
+        from pykrx import stock as pykrx_stock
+    except ImportError:
+        print("  [x] pykrx가 설치되어 있지 않습니다 (pip install pykrx)")
+        return pd.DataFrame(columns=["Symbol", "Name", "Market", "Marcap", "Close", "Amount", "Sector", "Industry"])
+
+    base = now_kst().date()
+    cap_df, used_date = pd.DataFrame(), None
+    for back in range(5):  # 휴장일 대비 최대 5일 소급
+        d = (base - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            tmp = pykrx_stock.get_market_cap_by_ticker(d, market=market)
+            if tmp is not None and not tmp.empty:
+                cap_df, used_date = tmp, d
+                break
+        except Exception:
+            continue
+
+    if cap_df.empty:
+        print(f"  [x] pykrx 폴백도 실패 — {market} 유니버스를 가져오지 못했습니다.")
+        return pd.DataFrame(columns=["Symbol", "Name", "Market", "Marcap", "Close", "Amount", "Sector", "Industry"])
+
+    cap_df = cap_df.reset_index().rename(columns={"티커": "Symbol"})
+    cap_df["Symbol"] = cap_df["Symbol"].astype(str).str.zfill(6)
+
+    name_map = {}
+    for t in cap_df["Symbol"]:
+        try:
+            name_map[t] = pykrx_stock.get_market_ticker_name(t)
+        except Exception:
+            name_map[t] = t
+
+    out = pd.DataFrame({
+        "Symbol": cap_df["Symbol"],
+        "Name": cap_df["Symbol"].map(name_map),
+        "Market": market,
+        "Marcap": pd.to_numeric(cap_df.get("시가총액"), errors="coerce"),
+        "Close": pd.to_numeric(cap_df.get("종가"), errors="coerce"),
+        "Amount": pd.to_numeric(cap_df.get("거래대금"), errors="coerce"),
+    })
+    out["Sector"] = ""
+    out["Industry"] = ""
+    print(f"  [✓] pykrx 폴백 성공 ({market}, 기준일 {used_date}, {len(out)}종목)")
+    return out
+
 # ══════════════════════════════════════════
 # [A] 유니버스 사전 필터링 & [B] 일봉 DB (유지)
 # ══════════════════════════════════════════
@@ -243,8 +322,8 @@ def _normalize_listing(raw: pd.DataFrame, market: str) -> pd.DataFrame:
     return df
 
 def load_filtered_universe(marcap_min_억: int = PREFILTER_MARCAP_억, tvol_min_억: int = PREFILTER_TVOL_억) -> pd.DataFrame:
-    kospi = _normalize_listing(fdr.StockListing("KOSPI"), "KOSPI")
-    kosdaq = _normalize_listing(fdr.StockListing("KOSDAQ"), "KOSDAQ")
+    kospi = _normalize_listing(_fdr_stock_listing_with_retry("KOSPI"), "KOSPI")
+    kosdaq = _normalize_listing(_fdr_stock_listing_with_retry("KOSDAQ"), "KOSDAQ")
     raw_df = pd.concat([kospi, kosdaq], ignore_index=True)
     raw_df = raw_df[raw_df["Symbol"].str.len() == 6].dropna(subset=["Symbol","Name"])
 
@@ -573,6 +652,25 @@ def get_fundamental(supabase, symbol: str, name: str, dart_api_key: str = "", da
 # ══════════════════════════════════════════
 # [D] 퀀트 지표 (Strict Chase Momentum)
 # ══════════════════════════════════════════
+# [2026-09-23 채택, 주식/quant_core.py와 동일] ⑥ RVOL 게이트 재정의(50일평균×1.2),
+# ③ RS 다중기간 가중조합, ① VCP 끝점비교, ⑤ 눌림목(MA10 재진입) 상수 — 상세 근거는
+# 주식/quant_core.py 주석 참고(이 파일은 evaluate_entry_gates() 단일종목 조회 경로만
+# 실사용되므로 함수/상수만 동기화하고, run_screening_from_db의 횡단면 RS/성장가속 로직은
+# 동기화 대상 아님 — 이 파일에서 아무데서도 호출 안 되는 죽은 코드로 확인됨).
+RVOL_GATE_MULT = 1.2
+# [2026-09-23 같은 날 재수정, 주식/quant_core.py와 동일] 겹치지 않는 순차 4분기(각 63거래일)
+# 구간수익률 가중합으로 재정의(최초 반영판은 4개 항이 전부 오늘 종가를 공통 분자로 쓰는
+# 누적수익률이라 다중공선성 문제가 있었음 — 상세 근거는 주식/quant_core.py 주석 참고)
+RS_QUARTER_WEIGHTS = (0.4, 0.2, 0.2, 0.2)
+RS_QUARTER_DAYS = 63
+VCP_SWING_K = 10
+VCP_LOOKBACK_DAYS = 126
+VCP_MIN_LEGS = 2
+PULLBACK_MA_WINDOW = 10
+PULLBACK_BREAKOUT_LOOKBACK = 60
+BREAKOUT_LOOKBACK_DAYS = 252
+
+
 def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0) -> dict:
     """엄격한 돌파/추격매수(Chase Momentum) 지표 산출"""
     metrics = {}
@@ -590,7 +688,7 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
     metrics["growth_composite"] = (metrics["net_yoy"] * 0.5) + (op_yoy * 0.3) + (rev_yoy * 0.2)
 
     if len(df) < 60:
-        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","supply_demand","rs_60d","dynamic_overext_limit_pct",
+        return {k: 0 for k in ["growth_composite","mdd","dynamic_mdd_limit","liquidity_20d","ma20","ma60","high_60d","vol_5d","vol_60d","vol_50d","supply_demand","rs_60d","dynamic_overext_limit_pct",
                                 "ma50","ma150","ma200","ma200_1m_ago","ma200_3m_ago","w52_high","w52_low"]}
 
     # 2. Dynamic MDD (ATR 기반 생존 방어선)
@@ -621,6 +719,8 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
     # 6. Volume Surge (거래량 급증)
     metrics["vol_5d"] = vol.iloc[-5:].mean()
     metrics["vol_60d"] = vol.iloc[-60:].mean()
+    # [2026-09-23 채택, 주식/quant_core.py와 동일] ⑥ RVOL 게이트용 50일 평균거래량
+    metrics["vol_50d"] = vol.iloc[-50:].mean()
 
     # 7. Supply / Demand
     metrics["supply_demand"] = (fund.get("foreign_net_buy") or 0) + (fund.get("institute_net_buy") or 0)
@@ -631,6 +731,18 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
         metrics["rs_60d"] = stock_ret - benchmark_ret_60d
     else:
         metrics["rs_60d"] = 0.0
+
+    # [2026-09-23 채택, 같은 날 재수정, 주식/quant_core.py와 동일] ③ RS 다중기간 가중조합
+    # (순차 비중첩 4분기, 단일 252일 원수익률 대체)
+    n_quarters = len(RS_QUARTER_WEIGHTS)
+    total_days = RS_QUARTER_DAYS * n_quarters
+    if len(close) >= total_days + 1:
+        bounds = [close.iloc[-1]] + [close.iloc[-(RS_QUARTER_DAYS * k + 1)] for k in range(1, n_quarters + 1)]
+        metrics["stock_ret_252d"] = sum(
+            w * ((bounds[k] / bounds[k + 1] - 1) * 100) for k, w in enumerate(RS_QUARTER_WEIGHTS)
+        )
+    else:
+        metrics["stock_ret_252d"] = None
 
     # 9. [신규] 미너비니 트렌드 템플릿용 지표 — evaluate_gates(trend_mode="minervini")에서만 사용.
     # compute_trend_stats_from_closes()와 동일 정의(50/150/200일 정배열, 200일선 1/3개월 추세,
@@ -645,29 +757,141 @@ def calc_quant_metrics(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 
         recent_252 = close.iloc[-252:]
         metrics["w52_high"] = float(recent_252.max())
         metrics["w52_low"] = float(recent_252.min())
+        # [2026-09-20 결함4 수정, 주식/quant_core.py와 동일] 진짜 돌파 판정용 —
+        # "오늘을 제외한" 직전 252일 최고종가. w52_high는 오늘 포함이라 근접도 지표로는
+        # 문제없지만 돌파 시그널(어제까지 못 넘던 걸 오늘 넘었는가)에는 오늘을 빼야 한다.
+        metrics["prior_252d_high"] = float(close.iloc[-253:-1].max())
+        # [2026-09-20 채택, 주식/quant_core.py와 동일] "돌파 확인" — 오늘·어제 이틀 연속으로
+        # "그날 기준 직전 252일 최고종가"를 갱신해야만 진짜 돌파로 인정(가짜 돌파 필터).
+        if len(close) >= TREND_MIN_BARS + 1:
+            prior_high_yday = float(close.iloc[-254:-2].max())
+            c_today, c_yday = float(close.iloc[-1]), float(close.iloc[-2])
+            metrics["breakout_confirmed_2d"] = bool(
+                metrics["prior_252d_high"] > 0 and c_today > metrics["prior_252d_high"]
+                and prior_high_yday > 0 and c_yday > prior_high_yday
+            )
+        else:
+            metrics["breakout_confirmed_2d"] = False
+
+        # [2026-09-23 채택, 주식/quant_core.py와 동일] ⑤ 눌림목(pullback) 진입 신호 —
+        # 최근 60거래일 내 52주 신고가 단일일 돌파 이력 + 어제 10일선 이탈 후 오늘 재진입.
+        ma10_series = close.rolling(PULLBACK_MA_WINDOW).mean()
+        if len(close) >= 2 and pd.notna(ma10_series.iloc[-1]) and pd.notna(ma10_series.iloc[-2]):
+            breakout_raw_series = close > close.rolling(BREAKOUT_LOOKBACK_DAYS).max().shift(1)
+            recent_window = breakout_raw_series.iloc[-(PULLBACK_BREAKOUT_LOOKBACK + 1):-1]
+            had_breakout_recently = bool(recent_window.any()) if len(recent_window) else False
+            below_yesterday = bool(close.iloc[-2] < ma10_series.iloc[-2])
+            above_today = bool(close.iloc[-1] > ma10_series.iloc[-1])
+            metrics["pullback_ma10_reentry"] = bool(had_breakout_recently and below_yesterday and above_today)
+
+            below_mask = close < ma10_series
+            streak_id = (~below_mask).cumsum()
+            running_min = close.where(below_mask).groupby(streak_id).cummin()
+            local_low = running_min.shift(1)
+            local_low_today = local_low.iloc[-1] if len(local_low) else None
+            metrics["pullback_local_low"] = float(local_low_today) if pd.notna(local_low_today) else None
+        else:
+            metrics["pullback_ma10_reentry"] = False
+            metrics["pullback_local_low"] = None
+
+        # [2026-09-23 채택, 주식/quant_core.py와 동일] ① VCP(변동성수축패턴) 끝점비교 —
+        # "오늘"(마지막 행) 하루만 판정. breakout 유형 후보에만 AND로 적용하는 것은
+        # evaluate_gates()의 책임 — 여기서는 통과여부만 계산해둔다.
+        metrics["vcp_ok"] = vcp_passes_endpoint(close, vol, vol.rolling(50).mean())
     else:
         metrics["ma50"] = metrics["ma150"] = metrics["ma200"] = 0.0
         metrics["ma200_1m_ago"] = metrics["ma200_3m_ago"] = 0.0
         metrics["w52_high"] = metrics["w52_low"] = 0.0
+        metrics["prior_252d_high"] = 0.0
+        metrics["breakout_confirmed_2d"] = False
+        metrics["pullback_ma10_reentry"] = False
+        metrics["pullback_local_low"] = None
+        metrics["vcp_ok"] = False
 
     return metrics
 
+
+def vcp_passes_endpoint(close: pd.Series, volume: pd.Series, vol_50d: pd.Series) -> bool:
+    """① VCP(변동성수축패턴) 끝점비교 판정 — 주식/quant_core.py의 동일 함수를 그대로 이식
+    (look-ahead 없음 근거도 동일 — 주석은 원본 참고)."""
+    n = len(close)
+    pos = n - 1
+    start = pos - VCP_LOOKBACK_DAYS
+    if start < 0:
+        return False
+    confirm_end = pos - VCP_SWING_K + 1
+    if confirm_end <= start:
+        return False
+
+    c_arr = close.to_numpy()
+    v_arr = volume.to_numpy()
+    vol50_arr = vol_50d.to_numpy()
+    win = 2 * VCP_SWING_K + 1
+    roll_max = close.rolling(win, center=True).max().to_numpy()
+    roll_min = close.rolling(win, center=True).min().to_numpy()
+    is_high = (c_arr == roll_max) & ~np.isnan(roll_max)
+    is_low = (c_arr == roll_min) & ~np.isnan(roll_min)
+
+    h_local = np.where(is_high[start:confirm_end])[0] + start
+    l_local = np.where(is_low[start:confirm_end])[0] + start
+    if len(h_local) == 0 or len(l_local) == 0:
+        return False
+
+    pts = sorted([(i, 0) for i in h_local] + [(i, 1) for i in l_local])
+    cleaned = []
+    for i, typ in pts:
+        if cleaned and cleaned[-1][1] == typ:
+            pi, _ = cleaned[-1]
+            if (typ == 0 and c_arr[i] > c_arr[pi]) or (typ == 1 and c_arr[i] < c_arr[pi]):
+                cleaned[-1] = (i, typ)
+        else:
+            cleaned.append((i, typ))
+
+    legs, last_low_idx = [], None
+    for j in range(len(cleaned) - 1):
+        i1, t1 = cleaned[j]
+        i2, t2 = cleaned[j + 1]
+        if t1 == 0 and t2 == 1:
+            legs.append((c_arr[i1] - c_arr[i2]) / c_arr[i1] * 100)
+            last_low_idx = i2
+
+    if len(legs) < VCP_MIN_LEGS or last_low_idx is None:
+        return False
+    # [2026-09-23 강화, 주식/quant_core.py와 동일] 끝점비교 -> "끝 레그가 전체 레그 중
+    # 최솟값"으로 강화(중간 레그 확대 허용하던 구멍 제거).
+    if not (legs[-1] <= min(legs)):
+        return False
+
+    last_leg_vol = v_arr[last_low_idx:pos].mean() if pos > last_low_idx else v_arr[last_low_idx]
+    v50_at_breakout = vol50_arr[pos]
+    if np.isnan(v50_at_breakout) or last_leg_vol >= v50_at_breakout:
+        return False
+    return True
+
+
 def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vol: float,
-                    trend_mode: str = "minervini") -> dict:
-    """6대 매수 관문(성장/MDD/유동성/추세/돌파/수급) 판정 — 이 시스템의 유일한 판정 로직.
+                    trend_mode: str = "minervini", liq_min_억: float = 50,
+                    rs_percentile: float = None, growth_accel_pass: bool = True) -> dict:
+    """6대 매수 관문(성장/RS/유동성/추세/돌파/거래량) 판정 — 이 시스템의 유일한 판정 로직.
     run_screening_from_db, evaluate_entry_gates, quant_backTesting.strategy_filters가 전부 이걸 호출한다.
 
-    trend_mode="minervini"(기본값, [2026-09-12]부터 — 아래 검증 후 legacy에서 교체): 미너비니
-    트렌드 템플릿(compute_trend_stats_from_closes와 동일 정의: 50>150>200일 정배열, 200일선
-    1개월+3개월 연속 상승, 52주 고점 25% 이내, 52주 저점 대비 30% 이상 상승) 적용.
-    calc_quant_metrics()가 채워주는 ma50/ma150/ma200/ma200_1m_ago/ma200_3m_ago/w52_high/
-    w52_low가 필요 — 없거나 0이면(데이터 부족) 추세 미충족으로 처리한다.
-    trend_mode="legacy": 이전 방식(price>20MA>60MA만 확인하는 단기 추세 체크). 12년 백테스트로
-    비교 검증한 결과 legacy는 PF 0.41(적자), minervini+재보정 파라미터는 PF 1.19(전반부/후반부
-    둘 다 1 이상)로 확인되어 기본값을 교체함 — 되돌리려면 trend_mode="legacy"를 명시하면 된다."""
-    f_growth = bool(metrics["growth_composite"] > 0)
-    f_mdd = bool(metrics["mdd"] >= metrics["dynamic_mdd_limit"])
-    f_liq = bool(metrics["liquidity_20d"] >= 50)
+    [2026-09-20 채택, 주식/quant_core.py와 동일] MDD 게이트 삭제 -> RS 게이트로 교체
+    (minervini_pure_backtest.py에 MDD 게이트가 없고, 우회 실측 결과에도 영향 없었음).
+    rs_percentile: 12개월 수익률 전 종목 횡단면 백분위 — 호출부가 미리 계산해 넘겨야 하며,
+    None이면 데이터 없음으로 보고 통과 처리(하위호환).
+
+    trend_mode="minervini"(기본값): 미너비니 트렌드 템플릿(50>150>200일 정배열, 200일선
+    1개월 상승, 52주 고점 25% 이내, 52주 저점 대비 30% 이상 상승) 적용. [2026-09-20]
+    200일선 "3개월" 상승 조건은 minervini_pure_backtest.py에 없어 제거함.
+    trend_mode="legacy": 이전 방식(price>20MA>60MA만 확인하는 단기 추세 체크).
+    liq_min_억: 유동성 게이트 문턱값 override 파라미터(기본값 50은 기존 하드코딩 동작과 동일)."""
+    # [2026-09-20 채택, 주식/quant_core.py와 동일] growth_composite(느슨한 가중합) ->
+    # 순이익 YoY 단일 기준(미너비니 'C' 테스트). 15%는 실측 검증된 값(ARCHITECTURE.md 참고).
+    # [2026-09-23 채택, 주식/quant_core.py와 동일] ④ 성장 가속도 AND — 이 파일은 growth_accel_pass를
+    # 계산해 넘기는 호출부가 없어 기본값 True(=조건 없음)로 기존과 동일하게 동작한다.
+    f_growth = bool(metrics.get("net_yoy", 0.0) >= 15.0) and bool(growth_accel_pass)
+    f_rs = True if rs_percentile is None else bool(rs_percentile >= 70.0)
+    f_liq = bool(metrics["liquidity_20d"] >= liq_min_억)
 
     if trend_mode == "minervini":
         ma50, ma150, ma200 = metrics.get("ma50", 0), metrics.get("ma150", 0), metrics.get("ma200", 0)
@@ -675,11 +899,14 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
         w52_high, w52_low = metrics.get("w52_high", 0), metrics.get("w52_low", 0)
         has_data = ma200 > 0 and ma200_1m > 0 and ma200_3m > 0 and w52_high > 0 and w52_low > 0
         is_aligned = has_data and curr_price > ma50 > ma150 > ma200
-        is_ma200_trending = has_data and ma200 > ma200_1m and ma200 > ma200_3m
+        # [2026-09-20 발견·수정, 주식/quant_core.py와 동일] 1개월+3개월 둘 다 상승 요구는
+        # minervini_pure_backtest.py(검증대상)엔 없던 추가 조건 — 라이브 포팅 검증 실패의
+        # 주 원인으로 확인되어 1개월 조건만 남김.
+        is_ma200_trending = has_data and ma200 > ma200_1m
         near_52w_high = has_data and ((w52_high - curr_price) / w52_high * 100) <= 25
         above_52w_low = has_data and ((curr_price - w52_low) / w52_low * 100) >= 30
         f_trend = bool(has_data and is_aligned and is_ma200_trending and near_52w_high and above_52w_low)
-        trend_reason = (f"정배열(50>150>200MA) {is_aligned} · 200MA 1/3개월 상승 {is_ma200_trending} · "
+        trend_reason = (f"정배열(50>150>200MA) {is_aligned} · 200MA 1개월 상승 {is_ma200_trending} · "
                         f"52주고점대비 {((w52_high - curr_price) / w52_high * 100):.1f}% · "
                         f"52주저점대비 {((curr_price - w52_low) / w52_low * 100):+.1f}%") if has_data else "데이터 부족(264일 미만)"
     else:
@@ -687,35 +914,56 @@ def evaluate_gates(metrics: dict, curr_price: float, prev_price: float, today_vo
                        and (curr_price <= metrics["ma20"] * (1 + metrics["dynamic_overext_limit_pct"] / 100)))
         trend_reason = f"Price > 20MA > 60MA, 동적 과열캡 {metrics['dynamic_overext_limit_pct']:.1f}% 이내"
 
-    breakout_threshold = metrics["high_60d"] * 0.90
-    f_break_confirmed = bool((curr_price >= breakout_threshold) and (prev_price >= breakout_threshold))
-    f_break_strong_day1 = bool(
-        (curr_price >= breakout_threshold) and (today_vol > (metrics["vol_60d"] * STRONG_BREAKOUT_VOL_MULT)))
-    f_break = f_break_confirmed or f_break_strong_day1
+    # [2026-09-20 결함4 수정 + 돌파확인 채택, 주식/quant_core.py와 동일] 기존 로직(high_60d*0.90)은
+    # high_60d가 오늘 종가를 포함해 "60일 고점 근접" 판정일 뿐 돌파 판정이 아니었다. 오늘을
+    # 제외한 직전 252일 최고종가 돌파로 1차 수정 후, 가짜 돌파(즉시실패) 필터로 오늘·어제
+    # 이틀 연속 신고가 갱신을 요구하는 "돌파확인 2일"까지 채택(실측 검증 완료).
+    prior_high = metrics.get("prior_252d_high", 0.0)
+    f_breakout_raw = bool(metrics.get("breakout_confirmed_2d", False))
+    # [2026-09-23 채택, 주식/quant_core.py와 동일] ① VCP 끝점비교 — breakout 유형에만 AND.
+    vcp_ok = bool(metrics.get("vcp_ok", False))
+    f_breakout = f_breakout_raw and vcp_ok
 
-    f_vol = bool(
-        (metrics["vol_5d"] > (metrics["vol_60d"] * 1.5)) and (today_vol > (metrics["vol_60d"] * VOL_TODAY_SURGE_MULT)))
+    # [2026-09-23 채택, 주식/quant_core.py와 동일] ⑥ RVOL 게이트 재정의(50일평균×1.2)
+    vol_50d_val = metrics.get("vol_50d", 0.0)
+    f_vol = bool(vol_50d_val > 0 and today_vol >= (vol_50d_val * RVOL_GATE_MULT))
 
-    pass_count = int(sum([f_growth, f_mdd, f_liq, f_trend, f_break, f_vol]))
-    high_60d_val = metrics["high_60d"] if metrics["high_60d"] > 0 else 1
-    vol_60d_val = metrics["vol_60d"] if metrics["vol_60d"] > 0 else 1
+    # [2026-09-23 채택, 주식/quant_core.py와 동일] ⑤ 눌림목(pullback) OR — 추세템플릿·RVOL을
+    # 함께 요구(원전과 동일하게, 추세 무너진 종목의 우연한 10일선 재돌파를 걸러냄).
+    pullback_raw = bool(metrics.get("pullback_ma10_reentry", False))
+    pullback_signal = pullback_raw and f_trend and f_vol
+    f_break = f_breakout or pullback_signal
+    entry_type = "breakout" if f_breakout else ("pullback" if pullback_signal else None)
+
+    pass_count = int(sum([f_growth, f_rs, f_liq, f_trend, f_break, f_vol]))
+    vol_50d_ratio_base = vol_50d_val if vol_50d_val > 0 else 1
+
+    if f_breakout_raw and not vcp_ok:
+        break_reason = f"52주 신고가 돌파했으나 VCP(변동성수축) 조건 미충족 (직전 고점 {prior_high:,.0f})"
+    elif f_breakout:
+        break_reason = f"52주 신고가 돌파 + VCP 통과 (직전 고점 {prior_high:,.0f})"
+    elif pullback_signal:
+        break_reason = "눌림목(10일선) 재진입"
+    elif prior_high > 0:
+        break_reason = f"직전 52주 고점({prior_high:,.0f}) 대비 {(curr_price / prior_high * 100 - 100):+.1f}%"
+    else:
+        break_reason = "데이터 부족(253일 미만)"
 
     gates = {
         "growth": {"pass": f_growth, "label": "Growth Composite",
                    "reason": f"Comp {metrics['growth_composite']:+.1f}%"},
-        "mdd": {"pass": f_mdd, "label": "Dynamic MDD",
-                "reason": f"MDD {metrics['mdd']:.1f}% (Limit: {metrics['dynamic_mdd_limit']:.1f}%)"},
+        "rs": {"pass": f_rs, "label": "Relative Strength",
+               "reason": (f"RS 백분위 {rs_percentile:.0f}" if rs_percentile is not None else "데이터 없음(통과 처리)")},
         "liq": {"pass": f_liq, "label": "Liquidity", "reason": f"{metrics['liquidity_20d']:.0f}억"},
         "trend": {"pass": f_trend, "label": "Trend Alignment", "reason": trend_reason},
-        "break": {"pass": f_break, "label": "Price Breakout",
-                  "reason": (f"1일차 강한돌파(Vol≥60d×{STRONG_BREAKOUT_VOL_MULT:.1f})" if f_break_strong_day1
-                             else f"고점대비 {(curr_price / high_60d_val) * 100:.1f}% (2일 연속 돌파권)")},
+        "break": {"pass": f_break, "label": "Price Breakout", "reason": break_reason},
         "vol": {"pass": f_vol, "label": "Volume Surge",
-                "reason": f"Vol {(metrics['vol_5d'] / vol_60d_val):.1f}x 급증 (당일 거래량도 {VOL_TODAY_SURGE_MULT}x 이상)"},
+                "reason": f"당일거래량 {(today_vol / vol_50d_ratio_base):.2f}x (50일평균 대비, RVOL≥{RVOL_GATE_MULT}x 기준)"},
     }
     return {"pass_count": pass_count, "gates": gates,
-            "f_growth": f_growth, "f_mdd": f_mdd, "f_liq": f_liq,
-            "f_trend": f_trend, "f_break": f_break, "f_vol": f_vol}
+            "f_growth": f_growth, "f_rs": f_rs, "f_liq": f_liq,
+            "f_trend": f_trend, "f_break": f_break, "f_vol": f_vol,
+            "entry_type": entry_type}
 # ══════════════════════════════════════════
 # [E] 분리된 스크리닝 엔진 (Survival Filter -> Score Ranking)
 # ══════════════════════════════════════════
@@ -748,7 +996,7 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
         # [순위4] f_trend: 과열 캡을 ATR% 기반 동적 이격도로 적용 (dynamic_overext_limit_pct)
         g = evaluate_gates(metrics, curr_price, prev_price, today_vol)
         pass_count = g["pass_count"]
-        f_growth, f_mdd, f_liq, f_trend, f_break, f_vol = g["f_growth"], g["f_mdd"], g["f_liq"], g["f_trend"], g[
+        f_growth, f_rs, f_liq, f_trend, f_break, f_vol = g["f_growth"], g["f_rs"], g["f_liq"], g["f_trend"], g[
             "f_break"], g["f_vol"]
 
         if pass_count < watchlist_min:
@@ -796,7 +1044,7 @@ def run_screening_from_db(supabase, universe_df: pd.DataFrame, log_fn=print, reg
             "rs_60d": round(metrics.get("rs_60d", 0.0), 2),
             "filter_details": {
                 "Growth Composite": {"pass": f_growth, "reason": g["gates"]["growth"]["reason"]},
-                "Dynamic MDD": {"pass": f_mdd, "reason": g["gates"]["mdd"]["reason"]},
+                "Relative Strength": {"pass": f_rs, "reason": g["gates"]["rs"]["reason"]},
                 "Liquidity": {"pass": f_liq, "reason": g["gates"]["liq"]["reason"]},
                 "Trend Alignment": {"pass": f_trend, "reason": g["gates"]["trend"]["reason"]},
                 "Price Breakout": {"pass": f_break, "reason": g["gates"]["break"]["reason"]},
@@ -1162,7 +1410,48 @@ def is_sector_concentrated(candidate_symbol: str, sector_map: dict, holding_symb
         return True, cand_sector
     return False, None
 
-def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0) -> dict:
+# [2026-10-15 apex_nA3 profile] stock-search gate panel for the active strategy: the local batch (apex_nA3_publish.py) stores per-symbol gate bits in quant_screening_cache id 22;
+# this helper reads them (10-minute cache, env SUPABASE_URL / SUPABASE_KEY) and returns the same {pass_count, gates{A..F}} shape as evaluate_gates. None -> legacy gates (rollback = the batch stops writing id 22; snapshots older than 5 days are ignored).
+import os as _os_apex
+_APEX_SNAP = {"t": 0.0, "v": None}
+_APEX_GATES = {"A": "Trend template (SEPA)", "B": "RS percentile >= 92", "C": "New 52-week closing high", "D": "Market gate open (index > MA200, no MA50 pin)", "E": "Tradable (volume > 0)", "F": "Free slot (virtual portfolio)"}
+
+
+def _apex_gates_from_snapshot(snapshot, symbol, max_age_days=5):
+    if not snapshot or snapshot.get("profile") != "apex_nA3":
+        return None
+    try:
+        age = (datetime.now() - datetime.strptime(snapshot["asof"], "%Y-%m-%d")).days
+    except Exception:
+        return None
+    s = (snapshot.get("symbols") or {}).get(symbol)
+    if s is None or age > max_age_days:
+        return None
+    rs = s[6]
+    why = {"A": "SEPA trend template", "B": f"RS percentile {rs}" if rs is not None else "RS n/a", "C": "close above the prior 252-day high", "D": "index above MA200 and no MA50 pin for this market",
+           "E": "volume > 0", "F": "virtual portfolio has a free slot"}
+    gates = {k: {"name": _APEX_GATES[k], "pass": bool(s[i]), "reason": ("ok: " if s[i] else "not met: ") + why[k]} for i, k in enumerate("ABCDEF")}
+    return {"pass_count": int(sum(s[:6])), "gates": gates, "asof": snapshot["asof"]}
+
+
+def _apex_nA3_gates(symbol):
+    now = time.time()
+    if now - _APEX_SNAP["t"] > 600:
+        v = None
+        try:
+            url, key = _os_apex.environ.get("SUPABASE_URL"), _os_apex.environ.get("SUPABASE_KEY")
+            if url and key:
+                from supabase import create_client
+                r = create_client(url, key).table("quant_screening_cache").select("results").eq("id", 22).execute()
+                if r.data:
+                    v = json.loads(r.data[0]["results"])
+        except Exception as e:
+            print(f"[APEX GATES] snapshot unavailable ({type(e).__name__}); legacy gates used")
+        _APEX_SNAP["t"], _APEX_SNAP["v"] = now, v
+    return _apex_gates_from_snapshot(_APEX_SNAP["v"], symbol)
+
+
+def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float = 0.0, symbol: str = None) -> dict:
     """단일 종목 실시간 6관문 판정 (UI 검색용) — evaluate_gates()로 위임."""
     if df.empty or len(df) < 60:
         return None
@@ -1170,12 +1459,18 @@ def evaluate_entry_gates(df: pd.DataFrame, fund: dict, benchmark_ret_60d: float 
     if "ma20" not in metrics or metrics["ma20"] == 0:
         return None
 
+    if symbol:   # active strategy apex_nA3 (see _apex_nA3_gates); legacy gates when no fresh snapshot
+        _ag = _apex_nA3_gates(symbol)
+        if _ag:
+            return {"pass_count": _ag["pass_count"], "gates": _ag["gates"], "metrics": metrics}
     curr_price = int(df["Close"].iloc[-1])
     prev_price = int(df["Close"].iloc[-2]) if len(df) >= 2 else curr_price
     today_vol = df["Volume"].iloc[-1]
 
     g = evaluate_gates(metrics, curr_price, prev_price, today_vol)
-    key_to_letter = {"growth": "A", "mdd": "B", "liq": "C", "trend": "D", "break": "E", "vol": "F"}
+    # [2026-09-21 수정, 주식/quant_core.py와 동일] "mdd" -> "rs" 게이트 이름 변경 시
+    # 놓쳤던 곳(KeyError 크래시 유발 — /api/search/{symbol}이 직접 호출하는 경로).
+    key_to_letter = {"growth": "A", "rs": "B", "liq": "C", "trend": "D", "break": "E", "vol": "F"}
     gates = {key_to_letter[k]: {"name": v["label"], "pass": v["pass"], "reason": v["reason"]}
               for k, v in g["gates"].items()}
 
@@ -1954,7 +2249,7 @@ def load_full_krx_universe() -> pd.DataFrame:
     왜 안 보이지"가 없어야 하므로 최소한의 비교불가 종목(ETF/ETN/스팩/우선주/6자리
     코드가 아닌 것)만 제외하고 나머지는 전부 포함한다.
     """
-    df = fdr.StockListing('KRX')
+    df = _fdr_stock_listing_with_retry('KRX')
 
     name = df["Name"].astype(str)
     code = df["Code"].astype(str) if "Code" in df.columns else df["Symbol"].astype(str)

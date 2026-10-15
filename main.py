@@ -145,6 +145,7 @@ news_smart_cache = SmartCache()
 quant_smart_cache = SmartCache()
 
 krx_cache = TTLCache(maxsize=5, ttl=86400)
+krx_cache_lock = threading.Lock()  # [2026-09-17] cachetools @cached는 기본적으로 스레드 안전하지 않음
 # [2026-09-17] OOM 대응: maxsize=3000은 실사용 대비 과도하게 큰 상한이었다(50초 안에
 # 3000개 서로 다른 종목이 조회될 일은 사실상 없음) — 캐시 자체가 무제한처럼 동작해
 # 메모리 상한 역할을 못 하고 있었다. 실사용 패턴에 맞춰 상한/TTL을 축소.
@@ -288,35 +289,50 @@ def get_quant_dashboard(refresh: str = "false"):
         if refresh.lower() == "true":
             refresh_quant_cache()
             with quant_smart_cache.lock:
-                return {"status": "success", "data": quant_smart_cache.data}
+                # [2026-09-17] 다른 두 반환 경로와 일관되게 "cached" 필드 추가 — 강제 새로고침
+                # 직후의 값이므로 방금 새로 채운 것과 같은 의미로 False.
+                return {"status": "success", "data": quant_smart_cache.data, "cached": False}
         latest_ts = _get_latest_quant_ts()
         with quant_smart_cache.lock:
             if quant_smart_cache.data is not None and quant_smart_cache.last_ts == latest_ts:
                 return {"status": "success", "data": quant_smart_cache.data, "cached": True}
-        data = _fetch_all_quant()
-        with quant_smart_cache.lock:
+            # [2026-09-17] 조회(_fetch_all_quant)도 같은 락 안에서 수행 — 캐시 만료 직후
+            # 동시에 들어온 요청들이 전부 stale 판정을 내리고 각자 Supabase를 중복 조회하던
+            # 것(thundering herd)을 방지. 이 엔드포인트는 호출 빈도가 낮아 락을 조회 시간만큼
+            # 길게 잡아도 문제되지 않음.
+            data = _fetch_all_quant()
             quant_smart_cache.data = data
             quant_smart_cache.last_ts = latest_ts
         return {"status": "success", "data": data, "cached": False}
     except Exception as e: return {"status": "error", "message": str(e)}
 
+# [2026-09-17] 캐싱 대상(_get_krx_list_cached)과 에러 응답 변환(get_krx_list)을 분리.
+# 기존엔 @cached가 걸린 함수 안에서 예외를 잡아 {"status":"error",...}를 정상 반환값처럼
+# 리턴했는데, cachetools는 반환값의 성공/실패를 구분하지 않고 그대로 캐시해버려서 일시적
+# 오류(FDR 캐시 지연 등) 한 번이면 이 에러 응답이 TTL(24시간) 내내 굳어버리는 문제가 있었다.
+# 예외를 raise한 채로 두면 cachetools가 캐시하지 않으므로(공식 동작), 캐싱은 성공한
+# 결과에만 걸리고 실패는 매 요청마다 새로 재시도된다.
+@cached(cache=krx_cache, lock=krx_cache_lock)
+def _get_krx_list_cached():
+    df = load_full_krx_universe()
+    records = [
+        {
+            "Symbol": row["Symbol"],
+            "Name": row["Name"],
+            "Market": row.get("Market", "-"),
+            "SearchStr": f'{row["Name"]} ({row["Symbol"]})',
+        }
+        for _, row in df.iterrows()
+    ]
+    return {"status": "success", "data": records}
+
 @app.get("/api/krx-list")
-@cached(cache=krx_cache)
 def get_krx_list(refresh: str = "false"):
     if refresh.lower() == "true":
-        krx_cache.clear()
+        with krx_cache_lock:
+            krx_cache.clear()
     try:
-        df = load_full_krx_universe()
-        records = [
-            {
-                "Symbol": row["Symbol"],
-                "Name": row["Name"],
-                "Market": row.get("Market", "-"),
-                "SearchStr": f'{row["Name"]} ({row["Symbol"]})',
-            }
-            for _, row in df.iterrows()
-        ]
-        return {"status": "success", "data": records}
+        return _get_krx_list_cached()
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -536,7 +552,7 @@ def search_stock(symbol: str, t: Optional[str] = None):
                 #          빠진 종목)은 core의 실제 추격매수 전략(evaluate_entry_gates)을 그대로 호출
                 is_kosdaq = str(market).upper().startswith("KOSDAQ")
                 benchmark_ret = _get_benchmark_return(is_kosdaq)
-                gate_result = evaluate_entry_gates(df_price, fund, benchmark_ret_60d=benchmark_ret)
+                gate_result = evaluate_entry_gates(df_price, fund, benchmark_ret_60d=benchmark_ret, symbol=symbol)
 
                 if gate_result:
                     gates = gate_result["gates"]
@@ -633,21 +649,28 @@ def get_macro_dashboard():
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
 backtest_result_cache = TTLCache(maxsize=1, ttl=300)  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
+backtest_result_cache_lock = threading.Lock()
 
 BACKTEST_12Y_CACHE_ID = 16  # quant_backtest_12y.py의 TBL_BACKTEST_12Y_CACHE_ID와 동일해야 함
 
+# [2026-09-17] krx-list와 동일한 이유로 캐싱 대상/에러 변환 분리 — 실패를 raise로 전파해
+# cachetools가 에러 응답을 캐시하지 않게 한다(성공한 결과만 5분간 캐시).
+@cached(cache=backtest_result_cache, lock=backtest_result_cache_lock)
+def _get_backtesting_12y_result_cached():
+    if not supabase:
+        raise RuntimeError("DB 설정 안됨")
+    res = supabase.table("quant_screening_cache").select("results").eq("id", BACKTEST_12Y_CACHE_ID).execute()
+    if res.data and res.data[0].get("results"):
+        return {"status": "success", "data": json.loads(res.data[0]["results"])}
+    return {"status": "success", "data": None}
+
 @app.get("/api/backtesting/12y-result")
-@cached(cache=backtest_result_cache)
 def get_backtesting_12y_result(refresh: str = "false"):
     if refresh.lower() == "true":
-        backtest_result_cache.clear()
-    if not supabase:
-        return {"status": "error", "message": "DB 설정 안됨"}
+        with backtest_result_cache_lock:
+            backtest_result_cache.clear()
     try:
-        res = supabase.table("quant_screening_cache").select("results").eq("id", BACKTEST_12Y_CACHE_ID).execute()
-        if res.data and res.data[0].get("results"):
-            return {"status": "success", "data": json.loads(res.data[0]["results"])}
-        return {"status": "success", "data": None}
+        return _get_backtesting_12y_result_cached()
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -656,27 +679,36 @@ def get_backtesting_12y_result(refresh: str = "false"):
 #    프론트에서 새로고침 버튼 누르면 refresh=true로 캐시를 비우고 다시 읽음.
 SCREENER_CACHE_TTL = 3600
 screener_result_cache = TTLCache(maxsize=1, ttl=SCREENER_CACHE_TTL)
+screener_result_cache_lock = threading.Lock()
+
+# [2026-09-17] 위 두 엔드포인트와 동일한 이유로 캐싱 대상/에러 변환 분리. 특히 이 엔드포인트는
+# "배치가 아직 안 돌았거나 실패했을 수 있음" 케이스가 실제로 수 초~수 분 뒤 정상화되는
+# 일시적 상태인데, 기존엔 이 메시지가 그대로 1시간(SCREENER_CACHE_TTL) 굳어서 실제로는
+# 데이터가 채워진 뒤에도 화면에 계속 에러가 떴었다.
+@cached(cache=screener_result_cache, lock=screener_result_cache_lock)
+def _get_screener_data_cached():
+    if not supabase:
+        raise RuntimeError("DB 설정 안됨")
+    results = fetch_all_rows(supabase.table("stock_screener_snapshot").select("*"))
+    if not results:
+        raise RuntimeError("stock_screener_snapshot이 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)")
+
+    # 레짐은 배치 시점 값이 스냅샷에 이미 박혀있지만, 장중 갱신 사이의 미세한 지연을
+    # 없애기 위해 가벼운 단일 행 조회로 최신값을 덮어씀 (비용 거의 없음)
+    regime_cache = load_market_regime_cache(supabase)
+    is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
+    for row in results:
+        row["is_second_buy_regime"] = is_2nd_buy_regime
+
+    return {"status": "success", "data": results}
 
 @app.get("/api/screener")
-@cached(cache=screener_result_cache)
 def get_screener_data(refresh: str = "false"):
     if refresh.lower() == "true":
-        screener_result_cache.clear()
-    if not supabase:
-        return {"status": "error", "message": "DB 설정 안됨"}
+        with screener_result_cache_lock:
+            screener_result_cache.clear()
     try:
-        results = fetch_all_rows(supabase.table("stock_screener_snapshot").select("*"))
-        if not results:
-            return {"status": "error", "message": "stock_screener_snapshot이 비어있습니다 (배치가 아직 안 돌았거나 실패했을 수 있음)"}
-
-        # 레짐은 배치 시점 값이 스냅샷에 이미 박혀있지만, 장중 갱신 사이의 미세한 지연을
-        # 없애기 위해 가벼운 단일 행 조회로 최신값을 덮어씀 (비용 거의 없음)
-        regime_cache = load_market_regime_cache(supabase)
-        is_2nd_buy_regime = bool(regime_cache.get("is_2nd_buy_regime", False))
-        for row in results:
-            row["is_second_buy_regime"] = is_2nd_buy_regime
-
-        return {"status": "success", "data": results}
+        return _get_screener_data_cached()
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
