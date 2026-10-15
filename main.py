@@ -196,13 +196,16 @@ def _fetch_all_quant():
                 elif row["id"] == 12: data["trades"] = res_json
                 elif row["id"] == 13: data["history"] = res_json
             except: pass
-    r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2]).execute()
+    r2 = supabase.table("quant_screening_cache").select("id, results").in_("id", [1, 2, 22]).execute()
     if r2.data:
         for row in r2.data:
             try:
                 res_json = json.loads(row["results"])
                 if row["id"] == 1: data["confirmed"] = res_json
                 elif row["id"] == 2: data["watchlist"] = res_json
+                elif row["id"] == 22:   # nA3 regime ON/OFF per market (only these fields leave the snapshot; gate bits stay private)
+                    mo = res_json.get("market_open") or {}
+                    data["regime"] = {"KOSPI": bool(mo.get("KOSPI")), "KOSDAQ": bool(mo.get("KOSDAQ")), "asof": res_json.get("asof"), "d2_hot_day": bool(res_json.get("d2_hot_day"))}
             except: pass
 
     return data
