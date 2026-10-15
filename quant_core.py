@@ -1414,7 +1414,6 @@ def is_sector_concentrated(candidate_symbol: str, sector_map: dict, holding_symb
 # this helper reads them (10-minute cache, env SUPABASE_URL / SUPABASE_KEY) and returns the same {pass_count, gates{A..F}} shape as evaluate_gates. None -> legacy gates (rollback = the batch stops writing id 22; snapshots older than 5 days are ignored).
 import os as _os_apex
 _APEX_SNAP = {"t": 0.0, "v": None}
-_APEX_GATES = {"A": "Trend template (SEPA)", "B": "RS percentile >= 92", "C": "New 52-week closing high", "D": "Market gate open (index > MA200, no MA50 pin)", "E": "Tradable (volume > 0)", "F": "Free slot (virtual portfolio)"}
 
 
 def _apex_gates_from_snapshot(snapshot, symbol, max_age_days=5):
@@ -1424,14 +1423,14 @@ def _apex_gates_from_snapshot(snapshot, symbol, max_age_days=5):
         age = (datetime.now() - datetime.strptime(snapshot["asof"], "%Y-%m-%d")).days
     except Exception:
         return None
+    names, why = snapshot.get("gates") or {}, snapshot.get("why") or {}
     s = (snapshot.get("symbols") or {}).get(symbol)
-    if s is None or age > max_age_days:
+    n = len(names)
+    if s is None or age > max_age_days or n == 0 or len(s) < n + 1:
         return None
-    rs = s[6]
-    why = {"A": "SEPA trend template", "B": f"RS percentile {rs}" if rs is not None else "RS n/a", "C": "close above the prior 252-day high", "D": "index above MA200 and no MA50 pin for this market",
-           "E": "volume > 0", "F": "virtual portfolio has a free slot"}
-    gates = {k: {"name": _APEX_GATES[k], "pass": bool(s[i]), "reason": ("ok: " if s[i] else "not met: ") + why[k]} for i, k in enumerate("ABCDEF")}
-    return {"pass_count": int(sum(s[:6])), "gates": gates, "asof": snapshot["asof"]}
+    rs = s[n]
+    gates = {k: {"name": names[k], "pass": bool(s[i]), "reason": ("ok: " if s[i] else "not met: ") + (f"RS percentile {rs}" if str(names[k]).startswith("RS") and rs is not None else why.get(k, ""))} for i, k in enumerate(names)}
+    return {"pass_count": int(sum(s[:n])), "gates": gates, "asof": snapshot["asof"]}
 
 
 def _apex_nA3_gates(symbol):

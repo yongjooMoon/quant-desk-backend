@@ -359,7 +359,7 @@ def _find_in_screening_cache(symbol: str) -> Optional[dict]:
 #    {"Growth Composite": {...}, "Dynamic MDD": {...}, ...} 형태를 프론트가 기대하는
 #    {'A': {...}, 'B': {...}, ...} 형태로 변환 (evaluate_entry_gates()의 반환 형식과 동일하게 맞춤)
 def _map_filter_details_to_gates(filter_details: dict) -> dict:
-    labels = ['A', 'B', 'C', 'D', 'E', 'F']
+    labels = [chr(65 + i) for i in range(26)]   # A, B, C ... (the active nA3 strategy has 13 conditions; the legacy one had 6)
     mapped = {}
     for i, (name, detail) in enumerate(filter_details.items()):
         if i >= len(labels):
@@ -559,7 +559,7 @@ def search_stock(symbol: str, t: Optional[str] = None):
                     pass_count = gate_result["pass_count"]
                     metrics = gate_result["metrics"]
                     mom = ((curr_price - metrics["ma60"]) / metrics["ma60"] * 100) if metrics["ma60"] > 0 else 0
-                    score = float(min(99.9, max(0, (pass_count/6 * 50) + min(25, max(0, metrics.get("net_yoy", 0)/5)) + min(25, max(0, mom)))))
+                    score = float(min(99.9, max(0, (pass_count/max(1, len(gates)) * 50) + min(25, max(0, metrics.get("net_yoy", 0)/5)) + min(25, max(0, mom)))))
                 else:
                     gates, score = {}, 0.0
 
