@@ -862,8 +862,11 @@ def get_market_news(symbol: str, name: str = ""):
     try:
         ck = f"{symbol}:{nm}"
         if ck in news_stock_cache: return {"status": "success", "data": news_stock_cache[ck]}
-        r = supabase.table("market_news").select("id,title,summary,region,created_at,is_major").or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(12).execute()
-        out = [{"id": x["id"], "title": x["title"], "summary": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", x.get("summary") or "")).strip()[:140],
+        r = supabase.table("market_news").select("id,title,summary,region,sector_asset,sentiment_score,created_at,is_major").or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(30).execute()
+        def _clean(t):
+            t = re.sub(r"<br\s*/?>", "\n", t or "")
+            return re.sub(r"<[^>]+>", "", t).strip()[:3000]
+        out = [{"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
                 "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major"))} for x in (r.data or [])]
         news_stock_cache[ck] = out
         return {"status": "success", "data": out}
