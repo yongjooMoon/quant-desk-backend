@@ -850,6 +850,31 @@ def get_market_targets(symbol: str):
 
 news_stock_cache = TTLCache(maxsize=500, ttl=300)
 _NAME_OK = re.compile(r"[^0-9A-Za-z가-힣 &.\-]")
+sector_cache = TTLCache(maxsize=3000, ttl=86400)
+_SECTOR_SPLIT = re.compile(r"[와과및,·/\s]+")
+_SECTOR_GENERIC = {"장비", "서비스", "기기", "용품", "제품", "일반", "기타", "관련"}
+
+
+def _get_sector(symbol: str):
+    """(fine, label). fine = stock_fundamental.sector (industry name, used for news keywords); label = fine, else stock_sector.sector (coarse), for display."""
+    if symbol in sector_cache: return sector_cache[symbol]
+    try:
+        r = supabase.table("stock_fundamental").select("sector").eq("symbol", symbol).execute().data
+        fine = (r[0].get("sector") if r else None) or None
+        label = fine
+        if not label:
+            r = supabase.table("stock_sector").select("sector").eq("symbol", symbol).execute().data
+            label = (r[0].get("sector") if r else None) or None
+    except Exception as e:
+        print(f"[sector] {symbol} failed: {type(e).__name__}")
+        return (None, None)
+    sector_cache[symbol] = (fine, label)
+    return sector_cache[symbol]
+
+
+def _sector_tokens(sector):
+    toks = [t for t in _SECTOR_SPLIT.split(sector or "") if len(t) >= 2 and t not in _SECTOR_GENERIC]
+    return list(dict.fromkeys(toks))
 
 
 @app.get("/api/market/news/{symbol}")
@@ -862,12 +887,28 @@ def get_market_news(symbol: str, name: str = ""):
     try:
         ck = f"{symbol}:{nm}"
         if ck in news_stock_cache: return {"status": "success", "data": news_stock_cache[ck]}
-        r = supabase.table("market_news").select("id,title,summary,region,sector_asset,sentiment_score,created_at,is_major").or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(30).execute()
+        cols = "id,title,summary,region,sector_asset,sentiment_score,created_at,is_major"
+        r = supabase.table("market_news").select(cols).or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(30).execute()
         def _clean(t):
             t = re.sub(r"<br\s*/?>", "\n", t or "")
             return re.sub(r"<[^>]+>", "", t).strip()[:3000]
-        out = [{"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
-                "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major"))} for x in (r.data or [])]
+        def _fmt(x, via):
+            return {"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
+                    "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major")), "via": via}
+        out = [_fmt(x, "name") for x in (r.data or [])]
+        # Sector news: sector-name tokens found in the latest 300 articles (title hit = 2, summary/assets hit = 1 per token, keep score >= 2).
+        toks = _sector_tokens(_get_sector(symbol)[0])
+        if toks:
+            seen = {x["id"] for x in out}
+            scored = []
+            for x in (supabase.table("market_news").select(cols).order("created_at", desc=True).limit(300).execute().data or []):
+                if x["id"] in seen: continue
+                title = x.get("title") or ""
+                rest = (x.get("summary") or "") + " " + (x.get("sector_asset") or "")
+                sc = sum(2 for t in toks if t in title) + sum(1 for t in toks if t in rest)
+                if sc >= 2: scored.append((sc, x))
+            scored.sort(key=lambda p: (p[0], p[1].get("created_at") or ""), reverse=True)
+            out += [_fmt(x, "sector") for _, x in scored[:20]]
         news_stock_cache[ck] = out
         return {"status": "success", "data": out}
     except Exception as e:
@@ -881,11 +922,11 @@ def get_market_financials(symbol: str):
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
     try:
         f = supabase.table("stock_fundamental").select("*").eq("symbol", symbol).execute().data
-        if not f: return {"status": "none", "message": "재무 데이터가 없습니다"}
+        if not f: return {"status": "none", "message": "재무 데이터가 없습니다", "sector": _get_sector(symbol)[1]}
         f = f[0]
         q = supabase.table("stock_fundamental_quarterly").select("bsns_year,quarter,revenue_q,op_profit_q,net_income_q,eps_q,roe,debt_ratio,known_from").eq("symbol", symbol).order("bsns_year", desc=True).order("quarter", desc=True).limit(8).execute().data or []
         keys = ["revenue_cur", "revenue_prev", "op_profit_cur", "op_profit_prev", "net_income_cur", "net_income_prev", "op_margin", "net_margin", "roe", "roa", "debt_ratio", "per", "pbr", "eps_cur", "eps_prev", "dividend_yield", "marcap_억", "sector", "updated_at"]
-        return _sanitize_nan({"status": "success", "annual": {k: f.get(k) for k in keys}, "quarters": q})
+        return _sanitize_nan({"status": "success", "annual": {k: f.get(k) for k in keys}, "quarters": q, "sector": _get_sector(symbol)[1]})
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
