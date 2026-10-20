@@ -941,6 +941,128 @@ def _sanitize_nan(obj):
     if isinstance(obj, list):
         return [_sanitize_nan(v) for v in obj]
     return obj
+
+
+# ==============================================================================
+# Reports
+#   Stored in quant_screening_cache (no new table): id = CATEGORY_BASE[category] + int(YYYYMMDD),
+#   results = JSON text {category, report_date, title, html, received_at}. One report per category and day.
+#   ponytail: needs the id column to accept values up to ~2e8 (int4 max is 2.147e9); not verifiable from code.
+# ==============================================================================
+import hmac
+from datetime import date as _date, timezone as _timezone
+from fastapi import HTTPException, Header, Query
+
+CATEGORY_BASE = {"morning": 100_000_000}
+REPORT_RANGE = 99_999_999
+REPORT_MAX_BYTES = 3_000_000
+_CATEGORY_RE = re.compile(r"^[a-z_]{1,20}$")
+reports_list_cache = TTLCache(maxsize=64, ttl=60)
+reports_lock = threading.Lock()
+
+
+class ReportIn(BaseModel):
+    category: str
+    report_date: str
+    title: str
+    html: str
+
+
+def _report_id(category: str, d: _date) -> int:
+    return CATEGORY_BASE[category] + int(d.strftime("%Y%m%d"))
+
+
+def _parse_report_id(rid: int):
+    """Return (category, date) or None if the id is outside the known category ranges."""
+    for cat, base in CATEGORY_BASE.items():
+        if base <= rid <= base + REPORT_RANGE:
+            try:
+                s = str(rid - base).zfill(8)
+                return cat, _date(int(s[:4]), int(s[4:6]), int(s[6:]))
+            except ValueError:
+                return None
+    return None
+
+
+@app.post("/api/reports")
+def post_report(body: ReportIn, request: Request, x_report_token: Optional[str] = Header(None)):
+    expected = os.environ.get("REPORT_INGEST_TOKEN")
+    if not expected:
+        raise HTTPException(503, "report ingest disabled")
+    if not x_report_token or not hmac.compare_digest(x_report_token.encode(), expected.encode()):
+        raise HTTPException(401, "invalid token")
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > REPORT_MAX_BYTES + 100_000:
+        raise HTTPException(413, "payload too large")
+    if body.category not in CATEGORY_BASE or not _CATEGORY_RE.match(body.category):
+        raise HTTPException(422, "unknown category")
+    try:
+        d = _date.fromisoformat(body.report_date)
+    except ValueError:
+        raise HTTPException(422, "bad report_date")
+    if body.report_date != d.isoformat() or d > (datetime.now(KST).date() + timedelta(days=2)):
+        raise HTTPException(422, "bad report_date")
+    if not (1 <= len(body.title) <= 200):
+        raise HTTPException(422, "bad title")
+    nbytes = len(body.html.encode("utf-8"))
+    if not (1 <= nbytes <= REPORT_MAX_BYTES):
+        raise HTTPException(413 if nbytes else 422, "bad html size")
+    rid = _report_id(body.category, d)
+    now = datetime.now(_timezone.utc).isoformat()
+    payload = json.dumps({"category": body.category, "report_date": d.isoformat(), "title": body.title,
+                          "html": body.html, "received_at": now})
+    try:
+        supabase.table("quant_screening_cache").upsert({"id": rid, "results": payload, "updated_at": now}).execute()
+    except Exception as e:
+        print(f"[reports] upsert failed: {type(e).__name__}")
+        raise HTTPException(500, "store failed")
+    with reports_lock:
+        reports_list_cache.clear()
+    return {"status": "success", "id": rid, "category": body.category, "report_date": d.isoformat(), "bytes": nbytes}
+
+
+@app.get("/api/reports")
+def list_reports(category: str = "morning", limit: int = Query(60, ge=1, le=200)):
+    if category not in CATEGORY_BASE:
+        raise HTTPException(404, "unknown category")
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    key = (category, limit)
+    with reports_lock:
+        hit = reports_list_cache.get(key)
+    if hit is not None:
+        return hit
+    base = CATEGORY_BASE[category]
+    r = (supabase.table("quant_screening_cache").select("id, updated_at")
+         .gte("id", base).lte("id", base + REPORT_RANGE).order("id", desc=True).limit(limit).execute())
+    data = []
+    for x in r.data or []:
+        p = _parse_report_id(x["id"])
+        if p:
+            data.append({"id": x["id"], "category": p[0], "report_date": p[1].isoformat(), "updated_at": x.get("updated_at")})
+    out = {"status": "success", "data": data}
+    with reports_lock:
+        reports_list_cache[key] = out
+    return out
+
+
+@app.get("/api/reports/{report_id}")
+def get_report(report_id: int):
+    p = _parse_report_id(report_id)
+    if not p:
+        raise HTTPException(404, "not found")
+    if not supabase:
+        raise HTTPException(503, "DB not configured")
+    r = supabase.table("quant_screening_cache").select("results").eq("id", report_id).execute()
+    if not r.data:
+        raise HTTPException(404, "not found")
+    j = json.loads(r.data[0]["results"])
+    return {"status": "success", "id": report_id, "category": p[0], "report_date": p[1].isoformat(),
+            "title": j.get("title"), "html": j.get("html")}
+
+
 # ==============================================================================
 # 📈 [신규] 순수 DB 기반 차트 & 이동평균선 전용 API
 # ==============================================================================
