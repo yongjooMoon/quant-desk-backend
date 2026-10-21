@@ -15,6 +15,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 import infinite_engine as E
+import infinite_store as store
 
 router = APIRouter(prefix="/api/infinite")
 _sb = None
@@ -102,6 +103,7 @@ class TradeIn(BaseModel):
     tag: Optional[str] = ""
     order_no: Optional[str] = None
     source: str = "manual"
+    t_step: Optional[float] = Field(None, ge=0, le=2)     # manual T step of this fill (V4.0): 0.5 for a half buy, 1 for a full one; empty = rule engine decides
 
 
 class SyncIn(BaseModel):
@@ -146,6 +148,8 @@ def _view(row):
     out["unit_usd"] = round(E.unit_amount(st), 2)
     out["first_half"] = E.is_first_half(st)
     out["invested_usd"] = round(st["avg"] * st["qty"], 2)
+    out["used_seed_usd"] = round(st["principal"] - st["cash"], 2)                       # "사용한 시드": buys minus sell proceeds of this cycle
+    out["progress_pct"] = round((st["principal"] - st["cash"]) / st["principal"] * 100.0, 1) if st["principal"] > 0 else 0.0     # "진행도" of the owner's app = used seed / seed
     out["target_pct"] = E.TARGET_PCT[st["version"]][st["ticker"]]
     pc = row.get("prev_close")
     live = row.get("status") == "active"
@@ -154,22 +158,11 @@ def _view(row):
 
 
 def _next_key(key: str) -> str:
-    m = re.match(r"^(.*?)(?:-c(\d+))?$", key)
-    base, n = m.group(1), int(m.group(2) or 1)
-    return f"{base}-c{n + 1}"
+    return store.next_key(key)
 
 
 def _close_and_open_next(row, st_after):
-    """Called when a fill emptied the position (st_after: engine state with qty 0, T 0, principal re-based)."""
-    today = _dt.now(_tz.utc).date().isoformat()
-    realized = round(float(st_after["cash"]) - float(row["principal_usd"]), 2)
-    _sb.table("infinite_cycles").update(dict(status="done", end_date=today, realized_usd=realized, t_value=0, qty=0, avg_price=0, cash_usd=st_after["cash"], updated_at=_now())).eq("id", row["id"]).execute()
-    nxt = dict(cycle_key=_next_key(row["cycle_key"]), password_hash=row["password_hash"], cycle_no=int(row.get("cycle_no") or 1) + 1, prev_cycle_id=row["id"], name=row["name"], version=row["version"],
-               ticker=row["ticker"], exch_code=row["exch_code"], market_cls=row["market_cls"], splits=row["splits"], principal_usd=st_after["principal"], compounding=row["compounding"], start_date=today,
-               mode="normal", status="active", t_value=0, cash_usd=st_after["cash"] if row["compounding"] else row["principal_usd"], qty=0, avg_price=0, auto_order=row.get("auto_order", False),
-               extras={k: v for k, v in (row.get("extras") or {}).items() if k in ("t_mode",)})
-    r = _sb.table("infinite_cycles").insert(nxt).execute()
-    return r.data[0]
+    return store.close_and_open_next(_sb, row, st_after)
 
 
 @router.get("/cycles")
@@ -245,7 +238,7 @@ def add_trade(cycle_id: str, body: TradeIn, request: Request, x_infinite_passwor
         raise HTTPException(422, "bad trade_date")
     if row.get("status") == "done":
         raise HTTPException(409, "cycle is done")
-    st = E.apply_fills(_state(row), [dict(side=body.side, qty=body.qty, price=body.price, tag=body.tag or "")])
+    st = E.apply_fills(_state(row), [dict(side=body.side, qty=body.qty, price=body.price, tag=body.tag or "", t_step=body.t_step)])
     _sb.table("infinite_trades").insert(dict(cycle_id=cycle_id, trade_date=body.trade_date, side=body.side, qty=body.qty, price=body.price, tag=body.tag, order_no=body.order_no,
                                              t_after=st["T"], source=body.source)).execute()
     if st["qty"] <= 0 and int(row["qty"]) > 0:

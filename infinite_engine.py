@@ -14,9 +14,11 @@ TARGET_PCT = {"V4.0": {"TQQQ": 15.0, "SOXL": 20.0}, "V2.2": {"TQQQ": 10.0, "SOXL
 REVERSE_END_PCT = {"TQQQ": -15.0, "SOXL": -20.0}                                           # V4.0 reverse mode ends when the close is above avg * (1 + pct)
 FIRST_BUY_PREMIUM = 0.12            # first buy of a cycle: LOC limit = previous close * (1 + premium) so that it fills at the close (write-up: 10-15 percent above)
 T_RULE = {"half": 0.5, "full": 1.0, "quarter_sell_mult": 0.75}                              # V4.0 normal mode (write-up)
-# T update of the buy fills of one day, V4.0. mode "doc": the write-up (full unit +1, half +0.5, each half-size order counts 0.5). mode "observed": what the user's own account history shows in the first half
-# (T < N/2): a day on which the average-price order fills adds +2.0, a day with only star / ladder orders adds +0.5 per filled order. The second half could not be explained by either mode (single fills gave +0.5 and +1.5).
-T_MODE_DEFAULT = "doc"
+# T update of the buy fills of one day, V4.0. mode "app" (default) = the owner's app, read from its fill list (screenshots 2026-10-21): every filled buy order is one row. First half (T < N/2): when two or more buy orders
+# filled that day each row is +1, when exactly one filled that row is +0.5; the cycle's first buy +1; a quarter sell multiplies T by 0.75. Second half: a row is +1 when its amount is at least APP_FULL_RATIO of the one-unit
+# amount, else +0.5 (calibrated on three observations only: 0.63 -> +0.5, 0.71 -> +1, 0.74 -> +1.5 unexplained). mode "doc" = the write-up (each half-size order +0.5, a full unit +1).
+APP_FULL_RATIO = 0.7
+T_MODE_DEFAULT = "app"
 
 
 def r2(x):
@@ -129,6 +131,7 @@ def apply_fills(st, fills, close=None):
     ver = s["version"]
     bought_amt = 0.0
     fill_tags = []
+    manual_t = 0.0
     for f in fills:
         q, p = int(f["qty"]), float(f["price"])
         if q <= 0:
@@ -141,7 +144,10 @@ def apply_fills(st, fills, close=None):
             bought_amt += q * p
             tag = f.get("tag", "")
             if ver == "V4.0":
-                fill_tags.append(tag)
+                if f.get("t_step") is not None:                  # manual override of this fill's T step (e.g. +0.5 when only one of the two orders filled)
+                    manual_t += float(f["t_step"])
+                else:
+                    fill_tags.append((tag, q * p))
         else:
             sold_cost = s["avg"] * q
             s["qty"] -= q
@@ -154,6 +160,7 @@ def apply_fills(st, fills, close=None):
     if ver == "V4.0":
         if fill_tags:
             s["T"] = s["T"] + _t_increment(fill_tags, st, st.get("extras", {}).get("t_mode", T_MODE_DEFAULT))
+        s["T"] = s["T"] + manual_t
     else:
         unit = s["principal"] / s["splits"]
         s["T"] = round((s["avg"] * s["qty"]) / unit, 2) if s["qty"] > 0 else 0.0
@@ -164,15 +171,18 @@ def apply_fills(st, fills, close=None):
     return s
 
 
-def _t_increment(tags, st, mode):
-    """T added by one day's V4.0 buy fills (tags of the filled buy orders)."""
+def _t_increment(fills, st, mode):
+    """T added by one day's V4.0 buy fills; fills = [(tag, amount_usd)]."""
+    tags = [t for t, _ in fills]
     if "first_buy" in tags:
         return T_RULE["full"]
     first_half = is_first_half(st)
-    if mode == "observed" and first_half:
-        return 2.0 if "avg_buy" in tags else T_RULE["half"] * len(tags)
-    # doc: every half-size order = 0.5 in the first half, a full-size order = 1 in the second half; any other filled order counts as one half
-    inc = 0.0
+    if mode == "app":
+        if first_half:
+            return float(len(fills)) if len(fills) >= 2 else T_RULE["half"]
+        unit = unit_amount(st)
+        return sum(T_RULE["full"] if (unit > 0 and amt >= APP_FULL_RATIO * unit) else T_RULE["half"] for _, amt in fills)
+    inc = 0.0                                                         # doc: every half-size order = 0.5 in the first half, a full-size order = 1 in the second half
     for t in tags:
         inc += T_RULE["half"] if (first_half or t not in ("star_buy", "avg_buy")) else T_RULE["full"]
     return inc

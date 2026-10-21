@@ -115,6 +115,7 @@ def test_view_fields_and_orders(env):
     d = c.get("/api/infinite/cycles", headers=H).json()["data"][0]
     assert abs(d["star_pct"] - (-3.375)) < 1e-6 and d["first_half"] is False and d["target_pct"] == 20.0
     assert d["star_price"] == round(125.6306 * (1 - 0.03375), 2)
+    assert d["used_seed_usd"] == round(27567.4 - 17236.33, 2) and d["progress_pct"] == round((27567.4 - 17236.33) / 27567.4 * 100, 1)
     assert {"star_buy", "quarter_sell", "target_sell"} <= {o["tag"] for o in d["orders"]}
     seed(db, cycle_key="done", status="done", qty=0)
     done = [x for x in c.get("/api/infinite/cycles", headers=H).json()["data"] if x["cycle_key"] == "done"][0]
@@ -156,6 +157,17 @@ def test_manual_trade_applies_engine(env):
     assert c.post(f"/api/infinite/cycles/{a['id']}/trades", json={"trade_date": "bad", "side": "sell", "qty": 1, "price": 1}, headers=H).status_code == 422
     tr = c.get(f"/api/infinite/cycles/{a['id']}/trades", headers=H).json()["data"]
     assert len(tr) == 1 and tr[0]["t_after"] == 7.875
+
+
+def test_manual_half_step(env):
+    db, c = env
+    a = seed(db, t_value=9.375, qty=27, avg_price=150.96, cash_usd=20000)
+    # one order filled: rule engine says +0.5; manual t_step 1 overrides it, 0.5 keeps half
+    r = c.post(f"/api/infinite/cycles/{a['id']}/trades", json={"trade_date": "2026-10-09", "side": "buy", "qty": 2, "price": 142.52, "tag": "star_buy", "t_step": 0.5}, headers=H).json()
+    assert abs(r["data"]["t_value"] - 9.875) < 1e-9
+    r = c.post(f"/api/infinite/cycles/{a['id']}/trades", json={"trade_date": "2026-10-09", "side": "buy", "qty": 3, "price": 142.52, "tag": "avg_buy", "t_step": 1}, headers=H).json()
+    assert abs(r["data"]["t_value"] - 10.875) < 1e-9
+    assert c.post(f"/api/infinite/cycles/{a['id']}/trades", json={"trade_date": "2026-10-09", "side": "buy", "qty": 3, "price": 142.52, "t_step": 3}, headers=H).status_code == 422
 
 
 def test_cycle_end_opens_next_cycle(env):

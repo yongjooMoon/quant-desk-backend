@@ -56,14 +56,19 @@ s0 = st(qty=27, avg=147.667, T=10.5, cash=20000.0)
 s1 = E.apply_fills(s0, [dict(side="sell", qty=6, price=163.71, tag="quarter_sell")])
 assert abs(s1["T"] - 7.875) < 1e-9 and s1["qty"] == 21 and abs(s1["cash"] - (20000 + 6 * 163.71)) < 1e-6 and abs(s1["avg"] - 147.667) < 1e-9
 s2 = E.apply_fills(st(qty=21, avg=147.667, T=7.875, cash=20000.0), [dict(side="buy", qty=2, price=164.27, tag="star_buy")])
-assert abs(s2["T"] - 8.375) < 1e-9, "one filled half = +0.5"
+assert abs(s2["T"] - 8.375) < 1e-9, "one filled order = +0.5 (app mode)"
 both = [dict(side="buy", qty=3, price=142.52, tag="avg_buy"), dict(side="buy", qty=2, price=142.52, tag="star_buy")]
-assert abs(E.apply_fills(st(qty=27, avg=150.96, T=9.37, cash=20000.0), both)["T"] - 10.37) < 1e-9, "doc mode: two halves = +1"
-obs = st(qty=27, avg=150.96, T=9.37, cash=20000.0, extras={"t_mode": "observed"})
-assert abs(E.apply_fills(obs, both)["T"] - 11.37) < 1e-9, "observed mode matches the user's 2026-10-08 -> 10-09 step"
+assert abs(E.apply_fills(st(qty=27, avg=150.96, T=9.37, cash=20000.0, extras={"t_mode": "doc"}), both)["T"] - 10.37) < 1e-9, "doc mode: two halves = +1"
+obs = st(qty=27, avg=150.96, T=9.37, cash=20000.0, extras={"t_mode": "app"})
+assert abs(E.apply_fills(obs, both)["T"] - 11.37) < 1e-9, "app mode: both rows +1 each (owner app list)"
 f = E.apply_fills(st(cash=27400.0), [dict(side="buy", qty=4, price=151.95, tag="first_buy")])
 assert f["T"] == 1.0 and f["qty"] == 4 and abs(f["avg"] - 151.95) < 1e-9 and abs(f["cash"] - (27400 - 607.8)) < 1e-6
 
+# ---- app mode, second half: a row is +1 when its amount is >= 0.7 of the unit, else +0.5
+sh = st(qty=60, avg=136.7, T=21.375, cash=19300.0)               # unit 19300 / 18.625 = 1036.2
+assert abs(E.apply_fills(sh, [dict(side="buy", qty=7, price=93.67, tag="ladder")])["T"] - 21.875) < 1e-9        # 655.7 / 1036 = 0.63 -> +0.5 (owner list: 21.375 -> 21.875)
+assert abs(E.apply_fills(sh, [dict(side="buy", qty=8, price=98.65, tag="ladder")])["T"] - 22.375) < 1e-9        # 789 / 1036 = 0.76 -> +1
+# ---- replay of the owner's first cycle in app mode: T after 2026-10-15 fills = 21.375 (from the outstanding LOC price), after the whole list 24.375 per his app screenshot
 # ---- cycle end: target sell empties the position, T resets, compounding re-bases the principal
 end = E.apply_fills(st(qty=10, avg=100.0, T=12.0, cash=26000.0, principal=27400.0), [dict(side="sell", qty=10, price=120.0, tag="target_sell")])
 assert end["qty"] == 0 and end["T"] == 0.0 and abs(end["cash"] - 27200.0) < 1e-6 and abs(end["principal"] - 27200.0) < 1e-6
