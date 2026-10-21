@@ -21,7 +21,7 @@ assert abs(E.implied_T("V4.0", "SOXL", 40, 128.626, 124.28) - 23.38) < 0.01
 
 # ---- order sheet on 2026-09-25 (qty 12, avg 148.07, T = 5): user placed 2 @ 148.07, 2 @ 170.27 (LOC buys), 3 @ 170.28 LOC sell, 9 @ 177.68 limit sell
 o = E.plan_orders(st(qty=12, avg=148.07, T=5.0, cash=27400 - 12 * 148.07), 0)
-d = {x["tag"]: x for x in o}
+d = {x["tag"]: x for x in o if x["tag"] != "ladder_x"}
 assert (d["avg_buy"]["price"], d["avg_buy"]["qty"], d["avg_buy"]["type"]) == (148.07, 2, "LOC")
 assert (d["star_buy"]["price"], d["star_buy"]["qty"]) == (170.27, 2)
 assert (d["quarter_sell"]["price"], d["quarter_sell"]["qty"], d["quarter_sell"]["type"]) == (170.28, 3, "LOC")
@@ -29,13 +29,13 @@ assert (d["target_sell"]["price"], d["target_sell"]["qty"], d["target_sell"]["ty
 
 # ---- 2026-10-08 (qty 27, avg 150.959, T 9.37): avg order 3, star order 2 @ 166.99, quarter 6, target 21 @ 181.15
 o = E.plan_orders(st(qty=27, avg=150.959, T=9.375, cash=27400 - 27 * 150.959 + 96), 0)
-d = {x["tag"]: x for x in o}
+d = {x["tag"]: x for x in o if x["tag"] != "ladder_x"}
 assert d["avg_buy"]["qty"] == 3 and d["star_buy"]["qty"] == 2 and d["star_buy"]["price"] == 166.99
 assert d["quarter_sell"]["qty"] == 6 and d["target_sell"]["qty"] == 21 and d["target_sell"]["price"] == 181.15
 
 # ---- second half: one star-price buy of a full unit; no avg buy
 o = E.plan_orders(st(qty=60, avg=136.701, T=21.375, cash=19300.0), 0)
-assert [x["tag"] for x in o if x["side"] == "buy"] == ["star_buy"] and [x for x in o if x["tag"] == "quarter_sell"][0]["price"] == 134.82
+assert [x["tag"] for x in o if x["side"] == "buy" and x["tag"] != "ladder_x"] == ["star_buy"] and [x for x in o if x["tag"] == "quarter_sell"][0]["price"] == 134.82
 
 # ---- first buy of a cycle
 o = E.plan_orders(st(cash=27400.0), 150.0)
@@ -43,11 +43,11 @@ assert len(o) == 1 and o[0]["tag"] == "first_buy" and o[0]["price"] == 168.0 and
 
 # ---- cash guard: nothing is planned beyond the cash
 o = E.plan_orders(st(qty=12, avg=148.07, T=5.0, cash=100.0), 0)
-assert [x for x in o if x["side"] == "buy"] == []
+assert [x for x in o if x["side"] == "buy"] == [], "no cash: no buy and no ladder"
 
 # ---- V2.2: fixed unit = principal / N, half buys at avg and at star, sells 1/4 at star + rest at +10%
 v = dict(version="V2.2", ticker="TQQQ", splits=40, principal=40000.0, cash=36000.0, qty=100, avg=80.0, T=4.0, mode="normal", compounding=True, extras={})
-o = {x["tag"]: x for x in E.plan_orders(v, 0)}
+o = {x["tag"]: x for x in E.plan_orders(v, 0) if x["tag"] != "ladder_x"}
 assert o["avg_buy"]["qty"] == 6 and o["avg_buy"]["price"] == 80.0            # unit 1000, half 500 / 80 = 6.25 -> round 6
 assert abs(o["star_buy"]["price"] - round(80 * (1 + 8 / 100.0) - 0.01, 2)) < 1e-9 and o["quarter_sell"]["qty"] == 25 and o["target_sell"]["price"] == 88.0
 
@@ -82,4 +82,13 @@ assert abs(v2["T"] - 2.0) < 1e-9, "25 x 80 = 2000 / 1000 unit"
 # ---- reverse mode day 1: sell 1/20 at the close (40 splits), no buy
 r = E.plan_orders(st(qty=200, avg=100.0, T=39.5, cash=100.0, mode="reverse", extras={"reverse_day": 0}), 90.0)
 assert r == [dict(side="sell", type="MOC", qty=10, price=0.0, tag="reverse_first_sell")]
+# ---- ladder ("폭락장 대비 추가 매수") as in the owner's app: unit 1105.21, 9 shares at 120.12 -> 6 LOC buys of 1 share at 110.52, 100.47, 92.10, 85.02, 78.94, 73.68
+app = st(qty=83, avg=125.6306, T=24.375, cash=17268.93, principal=27600.0)
+lad = [(x["price"], x["qty"]) for x in E.plan_orders(app, 97.55) if x["tag"] == "ladder_x"]
+assert lad == [(110.52, 1), (100.47, 1), (92.1, 1), (85.02, 1), (78.94, 1), (73.68, 1)], lad
+assert not [x for x in E.plan_orders(dict(app, extras={"ladder_n": 0}), 97.55) if x["tag"] == "ladder_x"], "ladder can be switched off per cycle"
+# ladder fills do not count as extra T rows: 9 + 1 + 1 shares in the second half
+base = st(qty=83, avg=125.6306, T=24.375, cash=17268.93, principal=27600.0)
+f1 = E.apply_fills(base, [dict(side="buy", qty=9, price=97.0, tag="star_buy"), dict(side="buy", qty=1, price=97.0, tag="ladder_x"), dict(side="buy", qty=1, price=97.0, tag="ladder_x")])
+assert abs(f1["T"] - 25.375) < 1e-9 and f1["qty"] == 94, f1["T"]            # one row of (9+2) x 97 = 1067 >= 0.7 x unit -> +1
 print("test_infinite_engine: all checks passed (self-verification only)")

@@ -2,7 +2,7 @@
 Model (owner decision 2026-10-21): every cycle is a row of infinite_cycles with its own cycle_key and password (stored only as a scrypt hash); a finished cycle is closed (status done) and the next cycle is created
 as a NEW row that inherits the password hash. There is no global admin token.
 Auth: header X-Infinite-Password. GET /cycles returns every cycle whose password matches it; the other endpoints work on one cycle id and check that cycle's hash. Failed attempts are rate limited per client IP.
-Rule engine: infinite_engine.py (pure functions). Tables: sql/infinite_buy.sql. Cycles are created locally (주식/infinite_setup.py) or by the automatic next-cycle step; there is no public create endpoint.
+Rule engine: infinite_engine.py (pure functions). Tables: sql/infinite_buy.sql. Cycles are created by hand with POST /cycles (needs an existing cycle's password; the new cycle shares it), by 주식/infinite_setup.py, or by the automatic next-cycle step.
 """
 import os
 import re
@@ -76,6 +76,22 @@ def _cycle_for(cycle_id: str, password: Optional[str], request: Request):
 
 VERSIONS = {"V2.2": (10, 20, 30, 40), "V4.0": (20, 40)}
 TICKERS = {"TQQQ": ("0537", "OQ"), "SOXL": ("0066", "AX")}
+
+
+class CycleIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    version: str
+    ticker: str
+    splits: int
+    principal_usd: float = Field(gt=0)
+    compounding: bool = True
+    start_date: Optional[str] = None
+    t_value: float = Field(0, ge=0)
+    cash_usd: Optional[float] = None
+    qty: int = Field(0, ge=0)
+    avg_price: float = Field(0, ge=0)
+    cycle_key: Optional[str] = Field(None, max_length=40)
+    extras: dict = {}
 
 
 class CyclePatch(BaseModel):
@@ -178,6 +194,41 @@ def list_cycles(request: Request, x_infinite_password: Optional[str] = Header(No
     if not mine:
         _fail(ip)
     return {"status": "success", "data": [_view(r) for r in mine]}
+
+
+@router.post("/cycles")
+def create_cycle(body: CycleIn, request: Request, x_infinite_password: Optional[str] = Header(None)):
+    """New cycle by hand (another account / another strategy line). Needs the password of an existing cycle; the new cycle shares that password. auto_order starts OFF."""
+    _need_db()
+    ip = _client(request)
+    _check_rate(ip)
+    if not x_infinite_password:
+        _fail(ip)
+    rows = _sb.table("infinite_cycles").select("cycle_key,password_hash").execute().data or []
+    mine = [r for r in rows if verify_password(x_infinite_password, r["password_hash"])]
+    if not mine:
+        _fail(ip)
+    _validate(body.version, body.ticker, body.splits)
+    if body.start_date:
+        try:
+            _date.fromisoformat(body.start_date)
+        except ValueError:
+            raise HTTPException(422, "bad start_date")
+    taken = {r["cycle_key"] for r in rows}
+    key = body.cycle_key or f"{body.ticker.lower()}-{body.version.lower().replace('.', '')}"
+    if body.cycle_key and key in taken:
+        raise HTTPException(409, "cycle key already exists")
+    base, n = key, 1
+    while key in taken:
+        n += 1
+        key = f"{base}-{n}"
+    exch, mk = TICKERS[body.ticker]
+    cash = body.cash_usd if body.cash_usd is not None else max(body.principal_usd - body.qty * body.avg_price, 0.0)
+    row = dict(cycle_key=key, password_hash=mine[0]["password_hash"], cycle_no=1, name=body.name, version=body.version, ticker=body.ticker, exch_code=exch, market_cls=mk, splits=body.splits,
+               principal_usd=body.principal_usd, compounding=body.compounding, start_date=body.start_date, mode="normal", status="active", t_value=body.t_value, cash_usd=round(cash, 2), qty=body.qty,
+               avg_price=body.avg_price, auto_order=False, extras=dict(body.extras or {}, t_mode="app"))
+    r = _sb.table("infinite_cycles").insert(row).execute()
+    return {"status": "success", "data": _view(r.data[0])}
 
 
 @router.put("/cycles/{cycle_id}")

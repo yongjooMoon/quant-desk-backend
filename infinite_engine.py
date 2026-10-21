@@ -18,6 +18,7 @@ T_RULE = {"half": 0.5, "full": 1.0, "quarter_sell_mult": 0.75}                  
 # filled that day each row is +1, when exactly one filled that row is +0.5; the cycle's first buy +1; a quarter sell multiplies T by 0.75. Second half: a row is +1 when its amount is at least APP_FULL_RATIO of the one-unit
 # amount, else +0.5 (calibrated on three observations only: 0.63 -> +0.5, 0.71 -> +1, 0.74 -> +1.5 unexplained). mode "doc" = the write-up (each half-size order +0.5, a full unit +1).
 APP_FULL_RATIO = 0.7
+LADDER_N = 6                  # "폭락장 대비 추가 매수" (the owner's app guide): after each buy order of q shares for `amount`, LOC buys of 1 share at amount/(q+1), amount/(q+2) ... (6 of them); they only fill when the close falls that far
 T_MODE_DEFAULT = "app"
 
 
@@ -52,6 +53,16 @@ def unit_amount(st):
 
 def is_first_half(st):
     return st["T"] < st["splits"] / 2.0
+
+
+def _ladder(amount, qty, n):
+    """Extra 1-share LOC buys below a main buy: price = amount / (qty + k), k = 1..n (owner's app: unit 1105.21, 9 shares -> 110.52, 100.47, 92.10, 85.02, 78.94, 73.68)."""
+    out = []
+    for k in range(1, n + 1):
+        px = r2(amount / (qty + k))
+        if px > 0:
+            out.append(dict(side="buy", type="LOC", qty=1, price=px, tag="ladder_x"))
+    return out
 
 
 def plan_orders(st, prev_close, closes5=None):
@@ -91,6 +102,18 @@ def plan_orders(st, prev_close, closes5=None):
             kept.append(o)
             spent += cost
     out = kept
+    n_lad = int(st.get("extras", {}).get("ladder_n", LADDER_N))
+    if n_lad > 0:
+        amounts = {"avg_buy": B / 2.0 if is_first_half(st) else B, "star_buy": B / 2.0 if is_first_half(st) else B}
+        lad = []
+        for o in out:
+            if o["tag"] in amounts:
+                lad += _ladder(amounts[o["tag"]], o["qty"], n_lad)
+        spent = sum(o["qty"] * o["price"] for o in out)
+        for o in lad:                                                  # the ladder shares are bought only on a lower close, but never plan more than the cash left
+            if spent + o["price"] <= st["cash"] + 1e-6:
+                out.append(o)
+                spent += o["price"]
     # sells: quarter at the star price (LOC), the rest as a limit order at avg * (1 + target)
     qq = st["qty"] // 4
     if qq > 0:
@@ -173,6 +196,12 @@ def apply_fills(st, fills, close=None):
 
 def _t_increment(fills, st, mode):
     """T added by one day's V4.0 buy fills; fills = [(tag, amount_usd)]."""
+    extra = sum(a_ for t_, a_ in fills if t_ == "ladder_x")                # extra shares of the owner's ladder complete the main order: not a row of their own
+    fills = [(t_, a_) for t_, a_ in fills if t_ != "ladder_x"]
+    if extra and fills:
+        fills[-1] = (fills[-1][0], fills[-1][1] + extra)
+    elif extra:
+        fills = [("star_buy", extra)]
     tags = [t for t, _ in fills]
     if "first_buy" in tags:
         return T_RULE["full"]

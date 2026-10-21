@@ -159,6 +159,24 @@ def test_manual_trade_applies_engine(env):
     assert len(tr) == 1 and tr[0]["t_after"] == 7.875
 
 
+def test_create_cycle(env):
+    db, c = env
+    seed(db)
+    body = dict(name="TQQQ V2.2", version="V2.2", ticker="TQQQ", splits=30, principal_usd=30000, qty=100, avg_price=80.0, t_value=8.0)
+    assert c.post("/api/infinite/cycles", json=body).status_code == 401
+    assert c.post("/api/infinite/cycles", json=body, headers={"X-Infinite-Password": "nope"}).status_code == 401
+    assert c.post("/api/infinite/cycles", json=dict(body, splits=25), headers=H).status_code == 422
+    r = c.post("/api/infinite/cycles", json=body, headers=H)
+    assert r.status_code == 200
+    d = r.json()["data"]
+    assert d["cycle_key"] == "tqqq-v22" and d["exch_code"] == "0537" and d["auto_order"] is False and d["cash_usd"] == 22000.0 and d["status"] == "active"
+    assert db.tables["infinite_cycles"][1]["password_hash"] == db.tables["infinite_cycles"][0]["password_hash"]
+    r2 = c.post("/api/infinite/cycles", json=body, headers=H).json()["data"]
+    assert r2["cycle_key"] == "tqqq-v22-2", "auto key is made unique"
+    assert c.post("/api/infinite/cycles", json=dict(body, cycle_key="soxl-v4"), headers=H).status_code == 409
+    assert len(c.get("/api/infinite/cycles", headers=H).json()["data"]) == 3
+
+
 def test_manual_half_step(env):
     db, c = env
     a = seed(db, t_value=9.375, qty=27, avg_price=150.96, cash_usd=20000)
