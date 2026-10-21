@@ -26,6 +26,7 @@ class _Q:
 
     def select(self, cols="*"): self.op = "select"; return self
     def eq(self, c, v): self.f.append(lambda r: str(r.get(c)) == str(v)); return self
+    def neq(self, c, v): self.f.append(lambda r: str(r.get(c)) != str(v)); return self
     def order(self, c, desc=False): self.desc = desc; return self
     def limit(self, n): return self
     def insert(self, row): self.op, self.payload = "insert", row; return self
@@ -260,3 +261,21 @@ def test_backsolve(env):
     d = c.post("/api/infinite/backsolve", json=v4, headers=H).json()["data"]
     assert d["t_value"] is None and d["t_min"] is not None and d["notes"]
     assert c.post("/api/infinite/backsolve", json=dict(v4, splits=30), headers=H).status_code == 422
+
+
+def test_admin_reset_and_withdraw(env):
+    db, c = env
+    seed(db, owner="bob", cycle_key="bobs", auto_order=True)
+    assert c.post("/api/auth/admin/users/bob/reset-password", headers=H2).status_code == 403
+    assert c.post("/api/auth/admin/users/alice/reset-password", headers=H).status_code == 409, "admin is protected"
+    assert c.post("/api/auth/admin/users/nobody/reset-password", headers=H).status_code == 404
+    assert c.post("/api/auth/login", json=dict(username="bob", password="11111111")).status_code == 401
+    assert c.post("/api/auth/admin/users/bob/reset-password", headers=H).status_code == 200
+    assert c.post("/api/auth/login", json=dict(username="bob", password="11111111")).status_code == 200
+    assert c.post("/api/auth/login", json=dict(username="bob", password=PW)).status_code == 401
+    assert c.delete("/api/auth/admin/users/alice", headers=H).status_code == 409
+    assert c.delete("/api/auth/admin/users/bob", headers=H).status_code == 200
+    assert "bob" not in [u["username"] for u in db.tables["app_users"]]
+    cy = db.tables["infinite_cycles"][0]
+    assert cy["auto_order"] is False and cy["status"] == "paused", "withdrawn user's cycle stops trading"
+    assert c.get("/api/auth/me", headers=H2).status_code == 401

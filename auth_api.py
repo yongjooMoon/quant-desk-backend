@@ -20,6 +20,7 @@ _sb = None
 _fails = {}
 _lock = threading.Lock()
 MAX_FAILS, FAIL_WINDOW, TOKEN_HOURS = 10, 600, 12
+RESET_PASSWORD = "1" * 8      # what the admin's reset button sets (the user logs in with it)
 USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
@@ -165,3 +166,30 @@ def admin_decide(username: str, body: dict, authorization: Optional[str] = Heade
         raise HTTPException(409, "admin account cannot be changed")
     _sb.table("app_users").update(dict(status=dec, decided_at=_dt.now(_tz.utc).isoformat())).eq("username", username).execute()
     return {"status": "success", "username": username, "new_status": dec}
+
+
+def _target(username: str) -> dict:
+    row = _get(username) if USER_RE.match(username) else None
+    if row is None:
+        raise HTTPException(404, "user not found")
+    if row["role"] == "admin":
+        raise HTTPException(409, "admin account cannot be changed")
+    return row
+
+
+@router.post("/admin/users/{username}/reset-password")
+def admin_reset(username: str, authorization: Optional[str] = Header(None)):
+    admin_user(authorization)
+    _target(username)
+    _sb.table("app_users").update(dict(password_hash=hash_password(RESET_PASSWORD))).eq("username", username).execute()
+    return {"status": "success", "username": username}
+
+
+@router.delete("/admin/users/{username}")
+def admin_delete(username: str, authorization: Optional[str] = Header(None)):
+    """Withdraw an account. Its infinite-buying cycles are kept but paused with auto orders OFF, so the local executor stops trading them."""
+    admin_user(authorization)
+    _target(username)
+    _sb.table("infinite_cycles").update(dict(auto_order=False, status="paused")).eq("owner", username).neq("status", "done").execute()
+    _sb.table("app_users").delete().eq("username", username).execute()
+    return {"status": "success", "username": username}
