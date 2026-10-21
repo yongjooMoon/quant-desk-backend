@@ -3,13 +3,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import auth_api
 import infinite_api
 import infinite_engine as E
 
 app = FastAPI()
+app.include_router(auth_api.router)
 app.include_router(infinite_api.router)
 PW = "correct-horse-battery"
-H = {"X-Infinite-Password": PW}
+H = {"Authorization": "Bearer " + auth_api.make_token("alice")}
+H2 = {"Authorization": "Bearer " + auth_api.make_token("bob")}
 
 
 class _Res:
@@ -69,7 +72,7 @@ class FakeDB:
 
 
 def cycle(**kw):
-    b = dict(cycle_key="soxl-v4", password_hash=infinite_api.hash_password(PW), cycle_no=1, prev_cycle_id=None, name="SOXL V4", version="V4.0", ticker="SOXL", exch_code="0066", market_cls="AX",
+    b = dict(cycle_key="soxl-v4", owner="alice", cycle_no=1, prev_cycle_id=None, name="SOXL V4", version="V4.0", ticker="SOXL", exch_code="0066", market_cls="AX",
              splits=40, principal_usd=27567.4, compounding=True, start_date="2026-09-22", end_date=None, mode="normal", status="active", t_value=23.375, cash_usd=17236.33, qty=83, avg_price=125.6306,
              realized_usd=0, prev_close=97.55, closes5=None, extras={}, auto_order=False)
     b.update(kw)
@@ -79,8 +82,11 @@ def cycle(**kw):
 @pytest.fixture
 def env():
     db = FakeDB()
-    infinite_api._fails.clear()
+    auth_api._fails.clear()
+    auth_api.init(db)
     infinite_api.init(db)
+    for u, st in (("alice", "approved"), ("bob", "approved"), ("pat", "pending")):
+        db.table("app_users").insert(dict(username=u, password_hash=auth_api.hash_password(PW), name=u, phone="01012345678", role="admin" if u == "alice" else "user", status=st)).execute()
     return db, TestClient(app)
 
 
@@ -89,24 +95,27 @@ def seed(db, **kw):
     return r.data[0]
 
 
-def test_hash_roundtrip():
-    h = infinite_api.hash_password("abc12345")
-    assert h.startswith("scrypt$") and "abc12345" not in h
-    assert infinite_api.verify_password("abc12345", h) and not infinite_api.verify_password("abc12346", h) and not infinite_api.verify_password("x", "garbage")
-    assert infinite_api.hash_password("abc12345") != h, "random salt"
+def test_hash_and_token():
+    h = auth_api.hash_password("abc12345")
+    assert h.startswith("sha256$") and "abc12345" not in h
+    assert auth_api.verify_password("abc12345", h) and not auth_api.verify_password("abc12346", h) and not auth_api.verify_password("x", "garbage")
+    assert auth_api.hash_password("abc12345") != h, "random salt"
+    t = auth_api.make_token("alice", now=1000)
+    assert auth_api.parse_token(t, now=1000) == "alice" and auth_api.parse_token(t, now=1000 + 13 * 3600) is None
+    assert auth_api.parse_token(t[:-1] + ("0" if t[-1] != "0" else "1"), now=1000) is None and auth_api.parse_token("alice.99999999999.bad") is None
 
 
-def test_list_needs_matching_password(env):
+def test_list_only_own_cycles(env):
     db, c = env
     seed(db)
-    seed(db, cycle_key="other", password_hash=infinite_api.hash_password("another-pass-123"), name="other")
+    seed(db, cycle_key="other", owner="bob", name="other")
     assert c.get("/api/infinite/cycles").status_code == 401
-    assert c.get("/api/infinite/cycles", headers={"X-Infinite-Password": "nope"}).status_code == 401
-    r = c.get("/api/infinite/cycles", headers=H)
-    assert r.status_code == 200
-    data = r.json()["data"]
-    assert [d["name"] for d in data] == ["SOXL V4"], "only the cycle with the matching password"
-    assert "password_hash" not in data[0]
+    assert c.get("/api/infinite/cycles", headers={"Authorization": "Bearer junk"}).status_code == 401
+    data = c.get("/api/infinite/cycles", headers=H).json()["data"]
+    assert [d["name"] for d in data] == ["SOXL V4"], "only the caller's cycle"
+    assert [d["name"] for d in c.get("/api/infinite/cycles", headers=H2).json()["data"]] == ["other"]
+    pending = {"Authorization": "Bearer " + auth_api.make_token("pat")}
+    assert c.get("/api/infinite/cycles", headers=pending).status_code == 401, "pending account has no access"
 
 
 def test_view_fields_and_orders(env):
@@ -122,29 +131,50 @@ def test_view_fields_and_orders(env):
     assert done["orders"] == [], "a finished cycle has no order sheet"
 
 
-def test_rate_limit(env):
+def test_signup_login_approval(env):
     db, c = env
-    seed(db)
-    for _ in range(infinite_api.MAX_FAILS):
-        assert c.get("/api/infinite/cycles", headers={"X-Infinite-Password": "bad"}).status_code == 401
-    assert c.get("/api/infinite/cycles", headers=H).status_code == 429
+    body = dict(username="carol", password="longenough1", name="Carol", phone="010-1234-5678")
+    assert c.post("/api/auth/signup", json=dict(body, username="a b")).status_code == 422
+    assert c.post("/api/auth/signup", json=dict(body, password="short")).status_code == 422
+    assert c.post("/api/auth/signup", json=body).status_code == 200
+    assert c.post("/api/auth/signup", json=body).status_code == 409
+    assert c.post("/api/auth/login", json=dict(username="carol", password="longenough1")).status_code == 403, "pending"
+    assert c.get("/api/auth/admin/users", headers=H2).status_code == 403 and c.get("/api/auth/admin/users").status_code == 401
+    rows = c.get("/api/auth/admin/users", headers=H).json()["data"]
+    assert "carol" in [r["username"] for r in rows] and all("password_hash" not in r for r in rows)
+    assert c.post("/api/auth/admin/users/carol/decision", json={"decision": "approve"}, headers=H2).status_code == 403
+    assert c.post("/api/auth/admin/users/carol/decision", json={"decision": "maybe"}, headers=H).status_code == 422
+    assert c.post("/api/auth/admin/users/alice/decision", json={"decision": "reject"}, headers=H).status_code == 409, "admin is protected"
+    assert c.post("/api/auth/admin/users/carol/decision", json={"decision": "approve"}, headers=H).status_code == 200
+    r = c.post("/api/auth/login", json=dict(username="carol", password="longenough1"))
+    assert r.status_code == 200 and r.json()["user"]["role"] == "user"
+    tok = {"Authorization": "Bearer " + r.json()["token"]}
+    assert c.get("/api/auth/me", headers=tok).json()["user"]["username"] == "carol" and c.get("/api/infinite/cycles", headers=tok).json()["data"] == []
+    c.post("/api/auth/admin/users/carol/decision", json={"decision": "reject"}, headers=H)
+    assert c.get("/api/auth/me", headers=tok).status_code == 401, "rejection takes effect at once"
+    assert c.post("/api/auth/login", json=dict(username="carol", password="longenough1")).status_code == 403
 
 
-def test_update_password_and_delete(env):
+def test_login_rate_limit_and_wrong_password(env):
+    db, c = env
+    assert c.post("/api/auth/login", json=dict(username="nobody", password="x")).status_code == 401
+    for _ in range(auth_api.MAX_FAILS):
+        c.post("/api/auth/login", json=dict(username="alice", password="bad"))
+    assert c.post("/api/auth/login", json=dict(username="alice", password=PW)).status_code == 429
+
+
+def test_update_and_delete_own_cycle_only(env):
     db, c = env
     a = seed(db)
-    other = "id-nope"
-    assert c.put(f"/api/infinite/cycles/{a['id']}", json={"t_value": 24.0}, headers={"X-Infinite-Password": "bad"}).status_code == 401
-    assert c.put(f"/api/infinite/cycles/{other}", json={"t_value": 24.0}, headers=H).status_code == 401, "unknown id looks like a wrong password"
+    assert c.put(f"/api/infinite/cycles/{a['id']}", json={"t_value": 24.0}).status_code == 401
+    assert c.put(f"/api/infinite/cycles/{a['id']}", json={"t_value": 24.0}, headers=H2).status_code == 404, "another user's cycle"
+    assert c.put("/api/infinite/cycles/id-nope", json={"t_value": 24.0}, headers=H).status_code == 404
     r = c.put(f"/api/infinite/cycles/{a['id']}", json={"t_value": 24.0, "auto_order": True}, headers=H)
     assert r.status_code == 200 and r.json()["data"]["t_value"] == 24.0 and r.json()["data"]["auto_order"] is True
     assert c.put(f"/api/infinite/cycles/{a['id']}", json={}, headers=H).status_code == 422
     assert c.put(f"/api/infinite/cycles/{a['id']}", json={"mode": "bogus"}, headers=H).status_code == 422
-    assert c.post(f"/api/infinite/cycles/{a['id']}/password", json={"new_password": "short"}, headers=H).status_code == 422
-    assert c.post(f"/api/infinite/cycles/{a['id']}/password", json={"new_password": "brand-new-pass-1"}, headers=H).status_code == 200
-    assert c.get("/api/infinite/cycles", headers=H).status_code == 401
-    assert c.get("/api/infinite/cycles", headers={"X-Infinite-Password": "brand-new-pass-1"}).status_code == 200
-    assert c.delete(f"/api/infinite/cycles/{a['id']}", headers={"X-Infinite-Password": "brand-new-pass-1"}).status_code == 200
+    assert c.delete(f"/api/infinite/cycles/{a['id']}", headers=H2).status_code == 404
+    assert c.delete(f"/api/infinite/cycles/{a['id']}", headers=H).status_code == 200
     assert db.tables["infinite_cycles"] == []
 
 
@@ -164,13 +194,12 @@ def test_create_cycle(env):
     seed(db)
     body = dict(name="TQQQ V2.2", version="V2.2", ticker="TQQQ", splits=30, principal_usd=30000, qty=100, avg_price=80.0, t_value=8.0)
     assert c.post("/api/infinite/cycles", json=body).status_code == 401
-    assert c.post("/api/infinite/cycles", json=body, headers={"X-Infinite-Password": "nope"}).status_code == 401
     assert c.post("/api/infinite/cycles", json=dict(body, splits=25), headers=H).status_code == 422
     r = c.post("/api/infinite/cycles", json=body, headers=H)
     assert r.status_code == 200
     d = r.json()["data"]
     assert d["cycle_key"] == "tqqq-v22" and d["exch_code"] == "0537" and d["auto_order"] is False and d["cash_usd"] == 22000.0 and d["status"] == "active"
-    assert db.tables["infinite_cycles"][1]["password_hash"] == db.tables["infinite_cycles"][0]["password_hash"]
+    assert db.tables["infinite_cycles"][1]["owner"] == "alice"
     r2 = c.post("/api/infinite/cycles", json=body, headers=H).json()["data"]
     assert r2["cycle_key"] == "tqqq-v22-2", "auto key is made unique"
     assert c.post("/api/infinite/cycles", json=dict(body, cycle_key="soxl-v4"), headers=H).status_code == 409
@@ -196,7 +225,7 @@ def test_cycle_end_opens_next_cycle(env):
     nxt = r["next"]
     assert nxt["cycle_key"] == "soxl-v4-c2" and nxt["cycle_no"] == 2 and nxt["status"] == "active" and nxt["qty"] == 0 and nxt["t_value"] == 0
     assert abs(nxt["principal_usd"] - 27200.0) < 1e-6 and abs(nxt["cash_usd"] - 27200.0) < 1e-6 and nxt["prev_cycle_id"] == a["id"]
-    assert len(db.tables["infinite_cycles"]) == 2 and db.tables["infinite_cycles"][1]["password_hash"] == db.tables["infinite_cycles"][0]["password_hash"], "next cycle inherits the password"
+    assert len(db.tables["infinite_cycles"]) == 2 and db.tables["infinite_cycles"][1]["owner"] == "alice", "next cycle keeps the owner"
     assert c.post(f"/api/infinite/cycles/{a['id']}/trades", json={"trade_date": "2026-10-31", "side": "buy", "qty": 1, "price": 1.0}, headers=H).status_code == 409
     assert len(c.get("/api/infinite/cycles", headers=H).json()["data"]) == 2
     assert infinite_api._next_key("soxl-v4-c2") == "soxl-v4-c3"

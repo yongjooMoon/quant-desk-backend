@@ -1064,10 +1064,12 @@ def get_report(report_id: int):
 
 
 # ==============================================================================
-# Infinite-buying manager (Laor V2.2 / V4.0): router in infinite_api.py, rules in infinite_engine.py, tables in sql/infinite_buy.sql. Needs env INFINITE_ADMIN_TOKEN.
+# Infinite-buying manager (Laor V2.2 / V4.0): router in infinite_api.py, rules in infinite_engine.py, tables in sql/infinite_buy.sql; login in auth_api.py (sql/app_users.sql).
 # ==============================================================================
-import infinite_api
+import auth_api, infinite_api
+auth_api.init(supabase)
 infinite_api.init(supabase)
+app.include_router(auth_api.router)
 app.include_router(infinite_api.router)
 
 
