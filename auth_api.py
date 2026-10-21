@@ -1,6 +1,6 @@
 """auth_api.py - accounts for the private pages (calendar, infinite buying). Router mounted by main.py: auth_api.init(supabase); app.include_router(auth_api.router).
 Table app_users (sql/app_users.sql): username, password_hash "sha256$salt$hex", name, phone, role user|admin, status pending|approved|rejected.
-Flow: POST /signup -> status pending -> the admin approves or rejects in /admin/users -> POST /login returns a signed token (HMAC, 12 h) sent as `Authorization: Bearer <token>`.
+Flow: POST /signup (a rejected id may re-apply) -> status pending -> the admin approves or rejects in /admin/users -> POST /login returns a signed token (HMAC, 12 h) sent as `Authorization: Bearer <token>`.
 The signing key is derived from the server-side Supabase key, so no new environment variable is needed. Failed logins are rate limited per client IP."""
 import hashlib
 import hmac
@@ -96,7 +96,7 @@ class SignupIn(BaseModel):
     username: str
     password: str = Field(min_length=8, max_length=100)
     name: str = Field(min_length=1, max_length=30)
-    phone: str = Field(min_length=9, max_length=20)
+    phone: str = Field(min_length=8, max_length=20)
 
 
 class LoginIn(BaseModel):
@@ -109,11 +109,16 @@ def signup(body: SignupIn):
     _need_db()
     if not USER_RE.match(body.username):
         raise HTTPException(422, "id: 3-20 letters, digits or underscore")
-    if not re.match(r"^[0-9+\- ]{9,20}$", body.phone):
+    if not re.match(r"^[0-9+\- ]{8,20}$", body.phone.strip()):
         raise HTTPException(422, "bad phone number")
-    if _get(body.username):
+    row = dict(password_hash=hash_password(body.password), name=body.name.strip(), phone=body.phone.strip(), status="pending", decided_at=None)
+    old = _get(body.username)
+    if old and old["status"] != "rejected":
         raise HTTPException(409, "id already taken")
-    _sb.table("app_users").insert(dict(username=body.username, password_hash=hash_password(body.password), name=body.name.strip(), phone=body.phone.strip(), role="user", status="pending")).execute()
+    if old:      # a rejected applicant may submit again: the row goes back to pending with the new data
+        _sb.table("app_users").update(row).eq("username", body.username).execute()
+    else:
+        _sb.table("app_users").insert(dict(row, username=body.username, role="user")).execute()
     return {"status": "success", "message": "pending approval"}
 
 

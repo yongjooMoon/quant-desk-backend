@@ -153,6 +153,9 @@ def test_signup_login_approval(env):
     c.post("/api/auth/admin/users/carol/decision", json={"decision": "reject"}, headers=H)
     assert c.get("/api/auth/me", headers=tok).status_code == 401, "rejection takes effect at once"
     assert c.post("/api/auth/login", json=dict(username="carol", password="longenough1")).status_code == 403
+    assert c.post("/api/auth/signup", json=dict(body, name="Carol 2")).status_code == 200, "rejected id may re-apply"
+    assert [r for r in db.tables["app_users"] if r["username"] == "carol"][0]["status"] == "pending"
+    assert c.post("/api/auth/signup", json=body).status_code == 409, "pending id is taken"
 
 
 def test_login_rate_limit_and_wrong_password(env):
