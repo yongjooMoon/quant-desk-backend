@@ -773,12 +773,39 @@ def get_market_list(market: str = "ALL", sort: str = "volume", limit: int = 100)
         return {"status": "error", "message": str(e)}
 
 
+def _retry(fn, tries=3):
+    """Run fn(); retry with a short back-off. The market page fires 4 requests at once and the host sometimes answers [Errno 11] (resource temporarily unavailable)."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception:
+            if i == tries - 1: raise
+            time.sleep(0.4 * (i + 1))
+
+
+daily_df_cache = TTLCache(maxsize=200, ttl=120)
+
+
+def _market_daily(symbol):
+    """Daily bars of one stock from stock_daily. Unlike quant_core.load_price_from_db a DB error is raised (not turned into an empty frame, which showed as 'no daily data')."""
+    if symbol in daily_df_cache: return daily_df_cache[symbol]
+    res = _retry(lambda: supabase.table("stock_daily").select("date,open,high,low,close,volume").eq("symbol", symbol).order("date", desc=False).execute())
+    if not res.data: return pd.DataFrame()
+    df = pd.DataFrame(res.data)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index().rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    for col in ["Open", "High", "Low", "Close", "Volume"]: df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    if len(df) >= 2: daily_df_cache[symbol] = df
+    return df
+
+
 @app.get("/api/market/chart/{symbol}")
 def get_market_chart(symbol: str, tf: str = "D"):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
     try:
-        df = load_price_from_db(supabase, symbol)
+        df = _market_daily(symbol)
         if df.empty:
             return {"status": "error", "message": "일봉 데이터가 없습니다."}
         if len(df) < 2:
@@ -972,10 +999,10 @@ def get_market_financials(symbol: str):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
     try:
-        f = supabase.table("stock_fundamental").select("*").eq("symbol", symbol).execute().data
+        f = _retry(lambda: supabase.table("stock_fundamental").select("*").eq("symbol", symbol).execute().data)
         if not f: return {"status": "none", "message": "재무 데이터가 없습니다", "sector": _get_sector(symbol)[1]}
         f = f[0]
-        q = supabase.table("stock_fundamental_quarterly").select("bsns_year,quarter,revenue_q,op_profit_q,net_income_q,eps_q,roe,debt_ratio,known_from").eq("symbol", symbol).order("bsns_year", desc=True).order("quarter", desc=True).limit(8).execute().data or []
+        q = _retry(lambda: supabase.table("stock_fundamental_quarterly").select("bsns_year,quarter,revenue_q,op_profit_q,net_income_q,eps_q,roe,debt_ratio,known_from").eq("symbol", symbol).order("bsns_year", desc=True).order("quarter", desc=True).limit(8).execute().data) or []
         keys = ["revenue_cur", "revenue_prev", "op_profit_cur", "op_profit_prev", "net_income_cur", "net_income_prev", "op_margin", "net_margin", "roe", "roa", "debt_ratio", "per", "pbr", "eps_cur", "eps_prev", "dividend_yield", "marcap_억", "sector", "updated_at"]
         return _sanitize_nan({"status": "success", "annual": {k: f.get(k) for k in keys}, "quarters": q, "sector": _get_sector(symbol)[1]})
     except Exception as e:
