@@ -731,7 +731,7 @@ market_list_lock = threading.Lock()
 target_cache = TTLCache(maxsize=1000, ttl=86400)
 target_fail_cache = TTLCache(maxsize=1000, ttl=600)
 target_lock = threading.Lock()
-_SYMBOL_RE = re.compile(r"^\d{6}$")
+_SYMBOL_RE = re.compile(r"^[0-9A-Z]{6}$")      # KRX alphanumeric codes (e.g. 0013Y0) as well as 6-digit codes
 
 
 def _build_market_list():
@@ -779,8 +779,10 @@ def get_market_chart(symbol: str, tf: str = "D"):
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
     try:
         df = load_price_from_db(supabase, symbol)
-        if df.empty or len(df) < 2:
-            return {"status": "error", "message": "일봉 데이터가 부족합니다."}
+        if df.empty:
+            return {"status": "error", "message": "일봉 데이터가 없습니다."}
+        if len(df) < 2:
+            return {"status": "error", "message": "상장 직후 종목이라 일봉이 1일치뿐입니다. 다음 거래일부터 차트가 표시됩니다."}
         last, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
         tf = tf.upper()
         if tf in ("W", "M", "Y"):
