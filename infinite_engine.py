@@ -102,7 +102,8 @@ def plan_orders(st, prev_close, closes5=None):
             kept.append(o)
             spent += cost
     out = kept
-    n_lad = int(st.get("extras", {}).get("ladder_n", LADDER_N))
+    ex = st.get("extras") or {}
+    n_lad = int(ex.get("ladder_n", LADDER_N)) if ex.get("ladder") else 0                 # ladder only for cycles with the per-cycle ladder switch (extras.ladder) on
     if n_lad > 0:
         amounts = {"avg_buy": B / 2.0 if is_first_half(st) else B, "star_buy": B / 2.0 if is_first_half(st) else B}
         lad = []

@@ -84,6 +84,8 @@ r = E.plan_orders(st(qty=200, avg=100.0, T=39.5, cash=100.0, mode="reverse", ext
 assert r == [dict(side="sell", type="MOC", qty=10, price=0.0, tag="reverse_first_sell")]
 # ---- ladder ("폭락장 대비 추가 매수") as in the owner's app: unit 1105.21, 9 shares at 120.12 -> 6 LOC buys of 1 share at 110.52, 100.47, 92.10, 85.02, 78.94, 73.68
 app = st(qty=83, avg=125.6306, T=24.375, cash=17268.93, principal=27600.0)
+assert not [x for x in E.plan_orders(app, 97.55) if x["tag"] == "ladder_x"], "ladder is off unless extras.ladder"
+app = dict(app, extras={"ladder": True})
 lad = [(x["price"], x["qty"]) for x in E.plan_orders(app, 97.55) if x["tag"] == "ladder_x"]
 assert lad == [(110.52, 1), (100.47, 1), (92.1, 1), (85.02, 1), (78.94, 1), (73.68, 1)], lad
 assert not [x for x in E.plan_orders(dict(app, extras={"ladder_n": 0}), 97.55) if x["tag"] == "ladder_x"], "ladder can be switched off per cycle"
