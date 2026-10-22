@@ -724,6 +724,7 @@ def get_screener_data(refresh: str = "false"):
 #   - 목록: 로컬 배치(주식/market_list_publish.py, 평일 15:45 종가 수집 직후)가 quant_screening_cache id 23에 올린 마지막 2거래일 값 + stock_fundamental 시총
 #   - 차트: stock_daily(약 720일) 일봉에서 주/월/년을 계산
 #   - 목표가: 네이버 모바일 JSON API(비공식). 종목을 열 때만 조회, 24시간 캐시, 실패하면 10분간 재호출 없이 "없음" (재시도 루프 없음), 요청 간 0.4초
+#   - [2026-10-22] KIS invest-opinion (needs KIS_APP_KEY / KIS_APP_SECRET env) is tried first: latest target per broker over 180 days; Naver is the fallback
 # ==============================================================================
 market_list_cache = TTLCache(maxsize=1, ttl=300)
 market_list_lock = threading.Lock()
@@ -829,6 +830,47 @@ def _fetch_naver_targets(symbol):
             "median_recent": int(statistics.median(goals)) if goals else None, "n_recent": len(goals)}
 
 
+_kis_tok = {"v": None, "exp": 0.0}
+
+
+def _kis_token():
+    """KIS access token, cached in memory (issuing is limited to 1/min; a token lives 24h)."""
+    import requests as _rq
+    if _kis_tok["v"] and time.time() < _kis_tok["exp"]: return _kis_tok["v"]
+    base = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
+    r = _rq.post(f"{base}/oauth2/tokenP", json={"grant_type": "client_credentials", "appkey": os.environ["KIS_APP_KEY"], "appsecret": os.environ["KIS_APP_SECRET"]}, timeout=10)
+    tok = r.json()["access_token"]
+    _kis_tok.update(v=tok, exp=time.time() + 23 * 3600)
+    return tok
+
+
+def _fetch_kis_targets(symbol):
+    """KIS invest-opinion (FHKST663300C0), last 180 days; keep the latest target per broker."""
+    import requests as _rq, statistics
+    base = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
+    end = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    H = {"authorization": "Bearer " + _kis_token(), "appkey": os.environ["KIS_APP_KEY"], "appsecret": os.environ["KIS_APP_SECRET"], "tr_id": "FHKST663300C0", "custtype": "P"}
+    p = {"FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "16633", "FID_INPUT_ISCD": symbol,
+         "FID_INPUT_DATE_1": (end - timedelta(days=180)).strftime("%Y%m%d"), "FID_INPUT_DATE_2": end.strftime("%Y%m%d")}
+    r = _rq.get(f"{base}/uapi/domestic-stock/v1/quotations/invest-opinion", headers=H, params=p, timeout=8)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("rt_cd") != "0":
+        _kis_tok["exp"] = 0.0      # force a fresh token next time (e.g. expired token)
+        raise RuntimeError(f"kis rt_cd={j.get('rt_cd')}")
+    latest = {}
+    for x in sorted(j.get("output") or [], key=lambda x: x.get("stck_bsop_date", ""), reverse=True):
+        goal = int(str(x.get("hts_goal_prc") or "0").replace(",", "") or 0)
+        b = x.get("mbcr_name")
+        if goal and b and b not in latest:
+            d = x["stck_bsop_date"]
+            latest[b] = {"date": f"{d[:4]}-{d[4:6]}-{d[6:]}", "broker": b, "opinion": _norm_opinion(x.get("invt_opnn")), "goal": goal, "title": None}
+    reports = list(latest.values())
+    goals = [x["goal"] for x in reports]
+    return {"consensus": {"mean": int(statistics.mean(goals)) if goals else None, "recomm": None, "asof": reports[0]["date"] if reports else None}, "reports": reports,
+            "median_recent": int(statistics.median(goals)) if goals else None, "n_recent": len(goals), "source": "kis"}
+
+
 @app.get("/api/market/targets/{symbol}")
 def get_market_targets(symbol: str):
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
@@ -836,7 +878,14 @@ def get_market_targets(symbol: str):
         if symbol in target_cache: return {"status": "success", "cached": True, **target_cache[symbol]}
         if symbol in target_fail_cache: return {"status": "none", "message": "목표가를 가져오지 못했습니다 (잠시 후 다시 시도됩니다)"}
         try:
-            v = _fetch_naver_targets(symbol)
+            v = None
+            if os.environ.get("KIS_APP_KEY") and os.environ.get("KIS_APP_SECRET"):
+                try:
+                    v = _fetch_kis_targets(symbol)
+                except Exception as e:
+                    print(f"[targets] {symbol} kis failed, naver fallback: {type(e).__name__}")
+                if v is not None and not v["reports"]: v = None      # no KIS rows -> try Naver
+            if v is None: v = _fetch_naver_targets(symbol)
             if not v["consensus"]["mean"] and not v["reports"]:
                 target_fail_cache[symbol] = True
                 return {"status": "none", "message": "이 종목의 목표가 데이터가 없습니다"}
