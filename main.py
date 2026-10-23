@@ -298,8 +298,9 @@ def get_quant_dashboard(refresh: str = "false"):
                 # [2026-09-17] 다른 두 반환 경로와 일관되게 "cached" 필드 추가 — 강제 새로고침
                 # 직후의 값이므로 방금 새로 채운 것과 같은 의미로 False.
                 return {"status": "success", "data": quant_smart_cache.data, "cached": False}
-        # [2026-10-23 perf] the freshness check below is one DB round trip per request (1.0-1.6 s measured); skip it for 60 s after the last check
-        if quant_smart_cache.data is not None and time.time() - _quant_ts_checked["t"] < QUANT_TS_RECHECK_SEC:
+        # [2026-10-23 perf] the freshness check below is one DB round trip per request (1.0-1.6 s measured). While the background job
+        # (_quant_recheck, every QUANT_TS_RECHECK_SEC) is alive and has checked recently, serve the cache without touching the DB.
+        if quant_smart_cache.data is not None and time.time() - _quant_ts_checked["t"] < QUANT_TS_RECHECK_SEC * 3:
             return {"status": "success", "data": quant_smart_cache.data, "cached": True}
         latest_ts = _get_latest_quant_ts()
         with quant_smart_cache.lock:
@@ -1418,6 +1419,20 @@ def _macro_warm():
         print(f"[macro warm] failed: {type(e).__name__}: {str(e)[:100]}")
 
 
+def _quant_recheck():
+    """Background freshness check of the dashboard cache (the batch writes it once a day): reload only when the DB timestamp changed."""
+    try:
+        if not supabase: return
+        ts = _get_latest_quant_ts()
+        if quant_smart_cache.data is None or ts != quant_smart_cache.last_ts:
+            refresh_quant_cache()
+        else:
+            _quant_ts_checked["t"] = time.time()
+    except Exception as e:
+        print(f"[quant recheck] failed: {type(e).__name__}: {str(e)[:100]}")
+
+
+scheduler.add_job(_quant_recheck, "interval", seconds=QUANT_TS_RECHECK_SEC)
 scheduler.add_job(_macro_warm, "interval", minutes=4, next_run_time=datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(seconds=30))
 
 @app.on_event("startup")
