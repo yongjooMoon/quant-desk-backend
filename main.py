@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import random
 import threading
 import time
@@ -40,6 +41,32 @@ from real_estate import generate_excel_data
 load_dotenv()
 
 app = FastAPI()
+
+# [2026-10-23 perf] HTTP cache for the public read-only market data: weak ETag over the body + `Cache-Control: private, no-cache`.
+# The browser revalidates with If-None-Match and gets a body-less 304 when nothing changed (screener 327 KB gzip, chart 100 KB, ...).
+# no-cache (not max-age) on purpose: the refresh button and the 14:30 batch update are visible immediately. Registered BEFORE CORSMiddleware
+# so that CORS is the outer layer and its headers also go on the 304. Authenticated / mutating routes are not in the allow-list.
+_ETAG_PREFIXES = ("/api/macro", "/api/screener", "/api/backtesting", "/api/market/", "/api/krx-list", "/api/quant-dashboard", "/api/search/")
+
+
+@app.middleware("http")
+async def etag_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if request.method != "GET" or response.status_code != 200 or not path.startswith(_ETAG_PREFIXES):
+        return response
+    if "json" not in (response.headers.get("content-type") or ""):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    etag = 'W/"' + hashlib.md5(body).hexdigest() + '"'
+    cache_headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    inm = request.headers.get("if-none-match")
+    if inm and etag in [x.strip() for x in inm.split(",")]:
+        return Response(status_code=304, headers=cache_headers)
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    headers.update(cache_headers)
+    return Response(content=body, status_code=200, headers=headers, media_type=response.media_type)
+
 
 app.add_middleware(
     CORSMiddleware,
