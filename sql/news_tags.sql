@@ -10,3 +10,6 @@ create table if not exists stock_tags (
 );
 create index if not exists stock_tags_tags_gin on stock_tags using gin (tags);
 alter table stock_tags enable row level security;
+
+-- source link of every article (2026-10-23): sent by the scheduled collector (POST /api/news/ingest); duplicates are also caught by the same URL.
+alter table market_news add column if not exists source_url text;

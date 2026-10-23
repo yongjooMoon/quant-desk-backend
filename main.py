@@ -1065,6 +1065,20 @@ def _stock_tags(symbol):
     return tags
 
 
+_news_url_probe = TTLCache(maxsize=1, ttl=300)
+
+
+def _news_has_url():
+    """True once market_news.source_url exists (sql/news_tags.sql); re-checked every 5 minutes so the stock news keeps working before the column is created."""
+    if "ok" not in _news_url_probe:
+        try:
+            supabase.table("market_news").select("source_url").limit(1).execute()
+            _news_url_probe["ok"] = True
+        except Exception:
+            _news_url_probe["ok"] = False
+    return _news_url_probe["ok"]
+
+
 @app.get("/api/market/news/{symbol}")
 def get_market_news(symbol: str, name: str = ""):
     """Related news: (1) rows whose title or sector_asset mentions the stock name (name comes from the client; sanitized), (2) rows whose tags overlap the stock's tags
@@ -1076,14 +1090,14 @@ def get_market_news(symbol: str, name: str = ""):
     try:
         ck = f"{symbol}:{nm}"
         if ck in news_stock_cache: return {"status": "success", "data": news_stock_cache[ck]}
-        cols = "id,title,summary,region,sector_asset,sentiment_score,created_at,is_major"
+        cols = "id,title,summary,region,sector_asset,sentiment_score,created_at,is_major" + (",source_url" if _news_has_url() else "")
         r = supabase.table("market_news").select(cols).or_(f"title.ilike.%{nm}%,sector_asset.ilike.%{nm}%").order("created_at", desc=True).limit(30).execute()
         def _clean(t):
             t = re.sub(r"<br\s*/?>", "\n", t or "")
             return re.sub(r"<[^>]+>", "", t).strip()[:3000]
         def _fmt(x, via, matched=None):
             d = {"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
-                 "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major")), "via": via}
+                 "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major")), "via": via, "url": x.get("source_url") or ""}
             if matched: d["matched"] = matched
             return d
         out = [_fmt(x, "name") for x in (r.data or [])]
@@ -1275,11 +1289,13 @@ def get_report(report_id: int):
 # ==============================================================================
 # Infinite-buying manager (Laor V2.2 / V4.0): router in infinite_api.py, rules in infinite_engine.py, tables in sql/infinite_buy.sql; login in auth_api.py (sql/app_users.sql).
 # ==============================================================================
-import auth_api, infinite_api
+import auth_api, infinite_api, news_ingest_api
 auth_api.init(supabase)
 infinite_api.init(supabase)
+news_ingest_api.init(supabase)
 app.include_router(auth_api.router)
 app.include_router(infinite_api.router)
+app.include_router(news_ingest_api.router)
 
 
 # ==============================================================================
