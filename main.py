@@ -588,73 +588,111 @@ INDICATORS = [
     "REAL_YIELD_10Y", "CREDIT_SPREAD", "VIX", "WTI", "FEAR_GREED"
 ]
 
+macro_cache = TTLCache(maxsize=1, ttl=300)      # the macro table changes a few times a day; the uncached build took 2.4-3.0 s per request (measured 2026-10-23)
+macro_cache_lock = threading.Lock()
+MACRO_LIST_HISTORY = 30                         # points per indicator in the list response (cards draw the last 20 and the change); the chart modal asks /api/macro/history/{indicator}
+
+
+def _build_macro_full():
+    """All indicators with up to 1300 history points each (the former /api/macro body). Raises on DB errors so a failure is never cached."""
+    # 1. one query for every indicator: indicators x 1300 rows as the limit
+    total_limit = len(INDICATORS) * 1300
+    r = (supabase.table("macro_market_data")
+         .select("*")
+         .in_("indicator", INDICATORS)
+         .order("recorded_at", desc=True)
+         .limit(total_limit)
+         .execute())
+    if not r.data:
+        return []
+
+    macro_map = {}
+    count_map = {}
+
+    # 2. group the single result by indicator
+    for row in r.data:
+        ind = row["indicator"]
+
+        # at most 1300 points per indicator
+        if count_map.get(ind, 0) >= 1300:
+            continue
+
+        date_str = str(row["recorded_at"])[:10]
+        val = float(row["value"] if row["value"] is not None else 0)
+
+        # first sighting of an indicator (desc order, so the newest row)
+        if ind not in macro_map:
+            macro_map[ind] = {
+                "indicator": ind,
+                "display_name": row.get("display_name", ind),
+                "source": row.get("source", ""),
+                "value": val,
+                "unit": row.get("unit", ""),
+                "signal": row.get("signal") if row.get("signal") else "neutral",
+                "recorded_at": date_str,
+                "change_percent": 0.0,
+                "history": []
+            }
+            count_map[ind] = 0
+
+        # older points go to the front (ascending order)
+        macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
+        count_map[ind] += 1
+
+    # 3. change vs the previous point
+    for ind, data in macro_map.items():
+        hist = data["history"]
+        if len(hist) >= 2:
+            last_val = hist[-1]["value"]  # newest (end of the array)
+            prev_val = hist[-2]["value"]
+            if prev_val != 0:
+                data["change_percent"] = ((last_val - prev_val) / prev_val) * 100
+
+    return list(macro_map.values())
+
+
+def _macro_full_cached():
+    with macro_cache_lock:
+        if "v" in macro_cache: return macro_cache["v"]
+    data = _build_macro_full()
+    if data:                                    # an empty table is not cached
+        with macro_cache_lock:
+            macro_cache["v"] = data
+    return data
+
+
 @app.get("/api/macro")
-def get_macro_dashboard():
+def get_macro_dashboard(full: str = "false"):
+    """Cards + ticker data. Default: history trimmed to the last MACRO_LIST_HISTORY points; full=true returns the old shape (all history)."""
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
-
     try:
-        # 1. 한 번의 쿼리로 여러 indicator 데이터를 모두 가져옵니다.
-        # 지표 개수 * 1300개 만큼 넉넉하게 limit를 설정합니다.
-        total_limit = len(INDICATORS) * 1300
-        
-        r = (supabase.table("macro_market_data")
-             .select("*")
-             .in_("indicator", INDICATORS)
-             .order("recorded_at", desc=True)
-             .limit(total_limit)
-             .execute())
-
-        if not r.data:
-            return {"status": "success", "data": []}
-
-        macro_map = {}
-        count_map = {}
-
-        # 2. 단일 쿼리로 가져온 전체 데이터를 순회하며 지표별로 분류합니다.
-        for row in r.data:
-            ind = row["indicator"]
-            
-            # 각 지표(indicator)별로 1300개까지만 담도록 제한
-            if count_map.get(ind, 0) >= 1300:
-                continue
-                
-            date_str = str(row["recorded_at"])[:10]
-            val = float(row["value"] if row["value"] is not None else 0)
-
-            # 지표가 처음 등장했을 때 기본 구조 초기화 (desc 정렬이므로 첫 등장이 가장 최신 데이터)
-            if ind not in macro_map:
-                macro_map[ind] = {
-                    "indicator": ind,
-                    "display_name": row.get("display_name", ind),
-                    "source": row.get("source", ""),
-                    "value": val,
-                    "unit": row.get("unit", ""),
-                    "signal": row.get("signal") if row.get("signal") else "neutral",
-                    "recorded_at": date_str,
-                    "change_percent": 0.0,
-                    "history": []
-                }
-                count_map[ind] = 0
-            
-            # 과거 데이터가 배열 앞쪽(index 0)으로 가도록 insert (오름차순 정렬을 위함)
-            macro_map[ind]["history"].insert(0, {"date": date_str, "value": val})
-            count_map[ind] += 1
-
-        # 3. 전일 대비 증감률(change_percent) 계산
-        for ind, data in macro_map.items():
-            hist = data["history"]
-            if len(hist) >= 2:
-                last_val = hist[-1]["value"]  # 최신값 (배열 맨 끝)
-                prev_val = hist[-2]["value"]  # 직전값
-                if prev_val != 0:
-                    data["change_percent"] = ((last_val - prev_val) / prev_val) * 100
-
-        return {"status": "success", "data": list(macro_map.values())}
-
+        data = _macro_full_cached()
+        if full.lower() != "true":
+            data = [{**d, "history": d["history"][-MACRO_LIST_HISTORY:]} for d in data]
+        return {"status": "success", "data": data}
     except Exception as e:
         print(f"Macro fetch error: {e}")
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/macro/history/{indicator}")
+def get_macro_history(indicator: str, days: int = 1260):
+    """History of one indicator for the chart modal (last `days` points, ascending)."""
+    if not supabase:
+        return {"status": "error", "message": "DB 설정 안됨"}
+    if indicator not in INDICATORS:
+        return {"status": "error", "message": "unknown indicator"}
+    try:
+        for d in _macro_full_cached():
+            if d["indicator"] == indicator:
+                return {"status": "success", "indicator": indicator, "history": d["history"][-max(1, min(int(days), 1300)):]}
+        return {"status": "success", "indicator": indicator, "history": []}
+    except Exception as e:
+        print(f"Macro history error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 backtest_result_cache = TTLCache(maxsize=1, ttl=300)  # 5분 캐시. 프로젝트 기존 TTL 값이 있으면 그걸로 맞추세요.
 backtest_result_cache_lock = threading.Lock()
 
@@ -1359,6 +1397,20 @@ for hour, minute in BATCH_WARMUP_TIMES:
 # 메모리가 512MB 한도까지 올라가는 데 실측상 10~20분 걸렸으므로, 그보다 훨씬 짧은
 # 주기로 돌려야 한도 도달 전에 회수할 기회가 여러 번 생긴다.
 scheduler.add_job(_malloc_trim, "interval", minutes=3)
+
+
+def _macro_warm():
+    """Rebuild the macro cache in the background (TTL is 300 s) so a visitor never waits for the 2.4 s DB read."""
+    try:
+        data = _build_macro_full()
+        if data:
+            with macro_cache_lock:
+                macro_cache["v"] = data
+    except Exception as e:
+        print(f"[macro warm] failed: {type(e).__name__}: {str(e)[:100]}")
+
+
+scheduler.add_job(_macro_warm, "interval", minutes=4, next_run_time=datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(seconds=30))
 
 @app.on_event("startup")
 def start_scheduler():
