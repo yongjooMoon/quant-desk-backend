@@ -20,6 +20,21 @@ router = APIRouter(prefix="/api/news")
 _sb = None
 MAX_BYTES = 1_000_000
 MAX_AGE_H, MAX_FUTURE_H = 36, 3
+_INDEX = r"(코스피|코스닥|나스닥|S&P|다우|닛케이|항셍|상하이종합|필라델피아 반도체|반도체지수|DAX|유로스톡스)"
+_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_CENTRAL = re.compile(r"(기준금리|금리|FOMC|연준|금통위|한국은행|ECB|BOJ|일본은행|영란은행).{0,18}(동결|인하|인상|결정|유지)|(동결|인하|인상).{0,10}(기준금리|FOMC|금통위)")
+
+
+def infer_major(title, is_major):
+    """Backstop for the model's Is Major flag (it often misses these): an index named in the title with a move of 2% or more, or a central-bank rate decision.
+    Only upgrades False -> True; the model's True is kept."""
+    if is_major:
+        return True
+    if re.search(_INDEX, title) and any(float(x) >= 2.0 for x in _PCT.findall(title)):
+        return True
+    return bool(_CENTRAL.search(title))
+
+
 _TRACKING = re.compile(r"^(utm_|fbclid$|gclid$|ref$|cmpid$)", re.I)
 
 
@@ -135,7 +150,7 @@ def ingest(body: NewsBatch, request: Request, x_news_token: Optional[str] = Head
         if (url and url in urls) or is_duplicate(it.title, category, created, recent, summary=summary):
             out["skipped"] += 1; continue
         row = {"region": category, "sector_asset": it.assets.strip(), "title": it.title.strip(), "summary": summary, "sentiment_score": it.sentiment,
-               "is_major": it.is_major, "created_at": created.isoformat(), "tags": tags}
+               "is_major": infer_major(it.title, it.is_major), "created_at": created.isoformat(), "tags": tags}
         if it.source_url:
             row["source_url"] = it.source_url.strip()
         try:

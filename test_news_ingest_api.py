@@ -141,3 +141,16 @@ def test_canon_url():
 
 def test_ping(env):
     assert env[1].get("/api/news/ping").json() == {"ok": True}
+
+
+def test_infer_major():
+    assert N.infer_major("미 반도체 급락 여파로 아시아 증시 하락, 코스닥 3.5%·코스피 2.2% 급락", False)
+    assert N.infer_major("한국은행 기준금리 연 3.00% 동결", False) and N.infer_major("연준 금리 인상 결정", False)
+    assert not N.infer_major("코스피 0.8% 상승 마감", False) and not N.infer_major("미국 10년물 금리 5% 아래로 하락", False)
+    assert N.infer_major("아무 제목", True)
+
+
+def test_major_stored(env):
+    db, c = env
+    post(c, item(title="코스피 3.5% 급락, 외국인 매도", is_major=False, source_url=None))
+    assert db.rows[0]["is_major"] is True
