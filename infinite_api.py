@@ -6,6 +6,7 @@ Rule engine: infinite_engine.py (pure functions). Tables: sql/infinite_buy.sql +
 from datetime import date as _date, datetime as _dt, timezone as _tz
 from typing import Optional, List
 
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -31,13 +32,25 @@ def _need_db():
         raise HTTPException(503, "DB not configured")
 
 
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 def _cycle_for(cycle_id: str, user: dict):
     """The cycle row when it belongs to the logged-in user, else 404."""
     _need_db()
+    if not _ID_RE.match(cycle_id or ""):                   # an id of another shape never reaches the database filter
+        raise HTTPException(404, "cycle not found")
     row = ((_sb.table("infinite_cycles").select("*").eq("id", cycle_id).execute()).data or [None])[0]
     if row is None or row.get("owner") != user["username"]:
         raise HTTPException(404, "cycle not found")
     return row
+
+
+def _guard_auto_order(patch: dict, user: dict):
+    """Automatic orders go out through the OWNER's single broker account (the executor trades every active cycle with auto_order on, whoever owns it),
+    so only an admin may switch them on. Anyone may switch them off."""
+    if patch.get("auto_order") is True and user.get("role") != "admin":
+        raise HTTPException(403, "only an admin can enable automatic orders")
 
 
 VERSIONS = {"V2.2": (10, 20, 30, 40), "V4.0": (20, 40)}
@@ -192,6 +205,7 @@ def update_cycle(cycle_id: str, body: CyclePatch, user: dict = Depends(current_u
         raise HTTPException(422, "bad status")
     if not patch:
         raise HTTPException(422, "nothing to update")
+    _guard_auto_order(patch, user)
     patch["updated_at"] = _now()
     r = _sb.table("infinite_cycles").update(patch).eq("id", cycle_id).execute()
     return {"status": "success", "data": _view(r.data[0])}
@@ -246,6 +260,7 @@ def sync_cycle(cycle_id: str, body: SyncIn, user: dict = Depends(current_user)):
         patch["closes5"] = body.closes5[-5:]
     if body.state:
         patch.update({k: v for k, v in body.state.dict().items() if v is not None})
+    _guard_auto_order(patch, user)
     if patch:
         patch["updated_at"] = _now()
         _sb.table("infinite_cycles").update(patch).eq("id", cycle_id).execute()

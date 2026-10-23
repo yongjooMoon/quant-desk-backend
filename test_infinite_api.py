@@ -83,7 +83,8 @@ def cycle(**kw):
 @pytest.fixture
 def env():
     db = FakeDB()
-    auth_api._fails.clear()
+    auth_api._fails.clear(); auth_api._user_fails.clear(); auth_api._signups.clear()
+    auth_api.PBKDF2_ITERS = 2000                          # fast hashes for the tests (production: 600000)
     auth_api.init(db)
     infinite_api.init(db)
     for u, st in (("alice", "approved"), ("bob", "approved"), ("pat", "pending")):
@@ -98,7 +99,7 @@ def seed(db, **kw):
 
 def test_hash_and_token():
     h = auth_api.hash_password("abc12345")
-    assert h.startswith("sha256$") and "abc12345" not in h
+    assert h.startswith("pbkdf2_sha256$") and "abc12345" not in h     # was "sha256$" (single salted SHA-256) until 2026-10-23; old rows are still verified and upgraded at login
     assert auth_api.verify_password("abc12345", h) and not auth_api.verify_password("abc12346", h) and not auth_api.verify_password("x", "garbage")
     assert auth_api.hash_password("abc12345") != h, "random salt"
     t = auth_api.make_token("alice", now=1000)
@@ -279,3 +280,77 @@ def test_admin_reset_and_withdraw(env):
     cy = db.tables["infinite_cycles"][0]
     assert cy["auto_order"] is False and cy["status"] == "paused", "withdrawn user's cycle stops trading"
     assert c.get("/api/auth/me", headers=H2).status_code == 401
+
+
+# ---- own account, limits and the admin-only auto_order switch (2026-10-23 security pass)
+def _login(c, user, pw, ip="1.2.3.4"):
+    return c.post("/api/auth/login", json=dict(username=user, password=pw), headers={"cf-connecting-ip": ip})
+
+
+def test_account_profile_and_password_change(env):
+    db, c = env
+    r = c.get("/api/auth/me", headers=H2); assert r.status_code == 200 and r.json()["user"]["phone"] == "01012345678"
+    assert c.put("/api/auth/me", json=dict(name="Bob K", phone="010-9999-0000"), headers=H2).json()["user"]["name"] == "Bob K"
+    assert [r for r in db.tables["app_users"] if r["username"] == "bob"][0]["phone"] == "010-9999-0000"
+    assert c.put("/api/auth/me", json=dict(name="Bob", phone="abc"), headers=H2).status_code == 422
+    assert c.put("/api/auth/me", json=dict(name="x", phone="01012345678")).status_code == 401
+    # verify-password: right / wrong
+    assert c.post("/api/auth/me/verify-password", json=dict(password=PW), headers=H2).json()["ok"] is True
+    assert c.post("/api/auth/me/verify-password", json=dict(password="nope"), headers=H2).json()["ok"] is False
+    # change: wrong current -> 401; same -> 422; too simple -> 422; ok -> login works with the new one only
+    assert c.post("/api/auth/me/password", json=dict(current_password="bad", new_password="Brand-new-1"), headers=H2).status_code == 401
+    assert c.post("/api/auth/me/password", json=dict(current_password=PW, new_password=PW), headers=H2).status_code == 422
+    assert c.post("/api/auth/me/password", json=dict(current_password=PW, new_password="aaaaaaaa"), headers=H2).status_code == 422
+    assert c.post("/api/auth/me/password", json=dict(current_password=PW, new_password="short"), headers=H2).status_code == 422
+    assert c.post("/api/auth/me/password", json=dict(current_password=PW, new_password="Brand-new-1"), headers=H2).status_code == 200
+    assert _login(c, "bob", PW).status_code == 401 and _login(c, "bob", "Brand-new-1").status_code == 200
+
+
+def test_login_limits_per_ip_and_per_username_and_spoofed_forwarded_for(env):
+    db, c = env
+    for i in range(auth_api.USER_MAX_FAILS):               # one username attacked from ever-changing addresses (and a spoofed X-Forwarded-For)
+        r = c.post("/api/auth/login", json=dict(username="alice", password="bad"), headers={"cf-connecting-ip": f"9.9.9.{i}", "x-forwarded-for": f"6.6.6.{i}, 1.1.1.1"})
+        assert r.status_code == 401
+    assert _login(c, "alice", PW, ip="8.8.8.8").status_code == 429, "per-username limit holds whatever the address"
+    assert _login(c, "bob", PW, ip="8.8.8.8").status_code == 200, "other users are not locked"
+    for i in range(auth_api.MAX_FAILS):                    # one address trying many usernames
+        _login(c, f"user{i}x", "bad", ip="7.7.7.7")
+    assert _login(c, "bob", PW, ip="7.7.7.7").status_code == 429, "per-IP limit"
+    # the client IP never comes from the first X-Forwarded-For value
+    class _R:
+        headers = {"x-forwarded-for": "6.6.6.6, 5.5.5.5"}; client = None
+    assert auth_api._client(_R) == "5.5.5.5"
+
+
+def test_verify_password_is_not_an_oracle(env):
+    db, c = env
+    for _ in range(auth_api.USER_MAX_FAILS):
+        assert c.post("/api/auth/me/verify-password", json=dict(password="guess"), headers=H2).json()["ok"] is False
+    assert c.post("/api/auth/me/verify-password", json=dict(password=PW), headers=H2).status_code == 429
+
+
+def test_signup_limit_and_old_hash_upgrade(env):
+    db, c = env
+    for i in range(auth_api.SIGNUP_MAX):
+        assert c.post("/api/auth/signup", json=dict(username=f"new{i}x", password="longenough1", name="N", phone="01011112222"), headers={"cf-connecting-ip": "4.4.4.4"}).status_code == 200
+    assert c.post("/api/auth/signup", json=dict(username="new9x", password="longenough1", name="N", phone="01011112222"), headers={"cf-connecting-ip": "4.4.4.4"}).status_code == 429
+    legacy = "sha256$abcd$" + __import__("hashlib").sha256(("abcd" + PW).encode()).hexdigest()
+    assert auth_api.verify_password(PW, legacy) and not auth_api.verify_password("x", legacy)
+    [r for r in db.tables["app_users"] if r["username"] == "bob"][0]["password_hash"] = legacy
+    assert _login(c, "bob", PW, ip="3.3.3.3").status_code == 200
+    assert [r for r in db.tables["app_users"] if r["username"] == "bob"][0]["password_hash"].startswith("pbkdf2_sha256$"), "legacy hash upgraded at login"
+    assert not auth_api.verify_password("x", "pbkdf2_sha256$99999999999$s$00") and not auth_api.verify_password("x", "garbage")
+
+
+def test_only_admin_can_enable_auto_order(env):
+    db, c = env
+    b = seed(db, owner="bob") if "owner" in seed.__code__.co_varnames else None
+    if b is None:                                          # seed() without an owner argument: make bob's cycle by hand
+        b = dict(seed(db)); b["owner"] = "bob"
+        [r for r in db.tables["infinite_cycles"] if r["id"] == b["id"]][0]["owner"] = "bob"
+    assert c.put(f"/api/infinite/cycles/{b['id']}", json={"auto_order": True}, headers=H2).status_code == 403
+    assert c.put(f"/api/infinite/cycles/{b['id']}", json={"auto_order": False}, headers=H2).status_code == 200
+    assert c.put(f"/api/infinite/cycles/{b['id']}", json={"name": "mine"}, headers=H2).status_code == 200
+    assert c.post(f"/api/infinite/cycles/{b['id']}/sync", json={"state": {"auto_order": True}}, headers=H2).status_code == 403, "sync cannot be used to bypass it"
+    assert c.put("/api/infinite/cycles/..%2F..%2Fx", json={"name": "x"}, headers=H2).status_code in (404, 405)
+    assert c.put("/api/infinite/cycles/ab'%20or%20'1'='1", json={"name": "x"}, headers=H2).status_code == 404

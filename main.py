@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import ipaddress
 import random
 import threading
 import time
@@ -13,7 +14,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import uvicorn
 import FinanceDataReader as fdr
@@ -97,15 +98,17 @@ KST = ZoneInfo("Asia/Seoul")
 # 📊 프론트엔드에서 쏴주는 데이터를 받는 로깅 전용 API
 # ==============================================================================
 class VisitLogRequest(BaseModel):
-    referer: str
-    user_agent: str
-    screen_id: str
+    referer: str = Field(max_length=300)
+    user_agent: str = Field(max_length=300)
+    screen_id: str = Field(max_length=50)
 
 def get_geolocation_from_ip(ip: str):
     try:
         if ip in ["127.0.0.1", "localhost", "::1"]:
             return "Local", "Local"
             
+        if not ipaddress.ip_address(ip).is_global:          # only a valid public address is ever put into the lookup URL (it used to be any header text)
+            return "Unknown", "Unknown"
         url = f"http://ip-api.com/json/{ip}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=2) as response:
@@ -152,11 +155,23 @@ def _process_log_visit(client_ip: str, payload: VisitLogRequest):
     except Exception as e:
         print(f"Visitor logging error: {e}")
 
+_visit_hits = {}
+_visit_lock = threading.Lock()
+
+
 @app.post("/api/log-visit")
 async def log_visit(request: Request, body: VisitLogRequest, background_tasks: BackgroundTasks):
-    forwarded_for = request.headers.get("x-forwarded-for")
-    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
-    background_tasks.add_task(_process_log_visit, client_ip, body)
+    client_ip = auth_api._client(request)           # proxy-appended address, not the caller-written first X-Forwarded-For value
+    now = time.time()
+    with _visit_lock:                               # 30 visit logs per minute per address; more are accepted but not stored
+        xs = [t for t in _visit_hits.get(client_ip, []) if now - t < 60]
+        _visit_hits[client_ip] = xs + [now]
+        if len(_visit_hits) > 5000:
+            for k in [k for k, v in _visit_hits.items() if not v or now - v[-1] >= 60]:
+                _visit_hits.pop(k, None)
+        over = len(xs) >= 30
+    if client_ip != "?" and not over:
+        background_tasks.add_task(_process_log_visit, client_ip, body)
     return {"status": "success"}
 
 # ==============================================================================
@@ -417,9 +432,13 @@ def _get_benchmark_return(is_kosdaq: bool) -> float:
     return val
 
 
+_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}$")      # KRX codes (6 digits or alphanumeric), index names (KS11, US500, ...)
+
+
 @app.get("/api/search/{symbol}")
 def search_stock(symbol: str, t: Optional[str] = None):
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
+    if not _TICKER_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
 
     if symbol in funda_cache:
         return {"status": "success", "data": funda_cache[symbol], "cached": True}
@@ -1232,6 +1251,8 @@ app.include_router(infinite_api.router)
 def get_stock_chart_data(symbol: str):
     if not supabase:
         return {"status": "error", "message": "DB 설정 안됨"}
+    if not _TICKER_RE.match(symbol):
+        return {"status": "error", "message": "잘못된 종목코드"}
     
     try:
         # 1. DB에서 가격 데이터 불러오기 (quant_core의 함수 재사용)
@@ -1276,8 +1297,36 @@ def get_stock_chart_data(symbol: str):
 # ==============================================================================
 # 🏢 5. 부동산 아파트 실거래가 스캔 API (GET 스트리밍 원복 및 Render 타임아웃 방어 처리)
 # ==============================================================================
+_RE_RESULTS = {}                    # username -> (time, xlsx bytes, filename): one result per admin, kept 30 minutes
+_RE_BUSY = set()
+_RE_LOCK = threading.Lock()
+_RE_NAME_OK = re.compile(r"^[0-9A-Za-z가-힣 ()·\-]{1,40}$")
+
+
+def _re_clean_results():
+    now = time.time()
+    for k in [k for k, v in _RE_RESULTS.items() if now - v[0] > 1800]:
+        _RE_RESULTS.pop(k, None)
+
+
 @app.get("/api/realestate/build-stream")
-async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_date: str, end_date: str, filters: str = ""):
+async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_date: str, end_date: str, filters: str = "", authorization: Optional[str] = Header(None)):
+    # Admin only: this route crawls external APIs with the ADMIN's stored key. The page is disabled in the UI; a browser EventSource cannot send the
+    # Authorization header, so when the page is re-enabled it must read the stream with fetch().
+    admin = auth_api.admin_user(authorization)
+    if not (re.fullmatch(r"\d{5}", gu_code) and _RE_NAME_OK.match(gu_name) and _RE_NAME_OK.match(dong) and len(filters) <= 300):
+        raise HTTPException(422, "bad parameters")
+    try:
+        _s = datetime.strptime(start_date, "%Y-%m-%d"); _e = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(422, "bad date")
+    if _e < _s or (_e - _s).days > 366 * 3:
+        raise HTTPException(422, "date range must be 0..3 years")
+    with _RE_LOCK:
+        if admin["username"] in _RE_BUSY:
+            raise HTTPException(409, "a scan of this account is already running")
+        _RE_BUSY.add(admin["username"])
+
     async def event_generator():
         try:
             res = supabase.table("user_api_keys").select("rtms_key").eq("username", "admin").execute()
@@ -1313,24 +1362,31 @@ async def build_realestate_stream(gu_code: str, gu_name: str, dong: str, start_d
                     yield f"data: {json.dumps({'status': 'error', 'message': payload})}\n\n"
                     return
                 elif status == "success":
-                    app.state.last_excel_data = payload["data"]
-                    app.state.last_excel_filename = payload["filename"]
+                    with _RE_LOCK:
+                        _re_clean_results()
+                        _RE_RESULTS[admin["username"]] = (time.time(), payload["data"], payload["filename"])
                     yield f"data: {json.dumps({'status': 'done', 'message': '엑셀 생성 완료!'})}\n\n"
                     return
 
         except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
+            print(f"[realestate] scan failed: {type(e).__name__}: {e}")
+            yield f"data: {json.dumps({'status': 'error', 'message': 'scan failed (see the server log)'})}\n\n"
+        finally:
+            with _RE_LOCK:
+                _RE_BUSY.discard(admin["username"])
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/api/realestate/download")
-def download_realestate():
-    excel_data = getattr(app.state, "last_excel_data", None)
-    filename = getattr(app.state, "last_excel_filename", "부동산_실거래가.xlsx")
-    
-    if not excel_data:
-        return {"status": "error", "message": "다운로드할 데이터가 없습니다."}
-        
+def download_realestate(authorization: Optional[str] = Header(None)):
+    admin = auth_api.admin_user(authorization)
+    with _RE_LOCK:
+        _re_clean_results()
+        hit = _RE_RESULTS.get(admin["username"])
+    if not hit:
+        return {"status": "error", "message": "no data to download (build first)"}
+    _, excel_data, filename = hit
+
     encoded_filename = urllib.parse.quote(filename)
     return Response(
         content=excel_data,
