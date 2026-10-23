@@ -1048,9 +1048,27 @@ def _sector_tokens(sector):
     return list(dict.fromkeys(toks))
 
 
+_MARKET_TAGS = {"금리", "물가", "고용", "성장", "환율", "달러", "채권", "유가", "가스", "금", "구리·비철", "관세", "수출통제", "지정학", "증시수급", "공매도", "정책·규제", "중국경제"}
+stock_tags_cache = TTLCache(maxsize=4000, ttl=3600)
+
+
+def _stock_tags(symbol):
+    """Tags of a stock (stock_tags, built weekly by 주식/build_stock_tags.py); [] when the table is missing / empty."""
+    if symbol in stock_tags_cache: return stock_tags_cache[symbol]
+    try:
+        r = supabase.table("stock_tags").select("tags").eq("symbol", symbol).execute().data
+        tags = (r[0].get("tags") if r else None) or []
+    except Exception as e:
+        print(f"[stock_tags] {symbol} failed: {type(e).__name__}")
+        return []
+    stock_tags_cache[symbol] = tags
+    return tags
+
+
 @app.get("/api/market/news/{symbol}")
 def get_market_news(symbol: str, name: str = ""):
-    """Related news: market_news rows whose title or sector_asset mentions the stock name (name comes from the client; sanitized)."""
+    """Related news: (1) rows whose title or sector_asset mentions the stock name (name comes from the client; sanitized), (2) rows whose tags overlap the stock's tags
+    (industry tag = 3 points, market-wide tag = 1; then is_major, then recency), (3) sector-name tokens as the last fallback."""
     if not supabase: return {"status": "error", "message": "DB 설정 안됨"}
     if not _SYMBOL_RE.match(symbol): return {"status": "error", "message": "잘못된 종목코드"}
     nm = _NAME_OK.sub("", name).strip()[:30]
@@ -1063,12 +1081,32 @@ def get_market_news(symbol: str, name: str = ""):
         def _clean(t):
             t = re.sub(r"<br\s*/?>", "\n", t or "")
             return re.sub(r"<[^>]+>", "", t).strip()[:3000]
-        def _fmt(x, via):
-            return {"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
-                    "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major")), "via": via}
+        def _fmt(x, via, matched=None):
+            d = {"id": x["id"], "title": x["title"], "summary": _clean(x.get("summary")), "assets": x.get("sector_asset") or "", "score": x.get("sentiment_score") or 0,
+                 "region": x.get("region"), "time": (x.get("created_at") or "")[:16].replace("T", " "), "major": bool(x.get("is_major")), "via": via}
+            if matched: d["matched"] = matched
+            return d
         out = [_fmt(x, "name") for x in (r.data or [])]
+        # Tag news: the tag lists of the stock and of the article overlap. Failures (column / table not created yet) fall through to the sector-token path.
+        stags = _stock_tags(symbol)
+        n_tag = 0
+        if stags:
+            try:
+                seen = {x["id"] for x in out}
+                tr = supabase.table("market_news").select(cols + ",tags").overlaps("tags", stags).order("created_at", desc=True).limit(80).execute().data or []
+                ranked = []
+                for x in tr:
+                    if x["id"] in seen: continue
+                    hit = [t for t in (x.get("tags") or []) if t in stags]
+                    pts = sum(1 if t in _MARKET_TAGS else 3 for t in hit)
+                    ranked.append((pts, bool(x.get("is_major")), x.get("created_at") or "", x, hit))
+                ranked.sort(key=lambda p: (p[0], p[1], p[2]), reverse=True)
+                for _, _, _, x, hit in ranked[:20]:
+                    out.append(_fmt(x, "tag", hit)); n_tag += 1
+            except Exception as e:
+                print(f"[market news] tag path failed: {type(e).__name__}")
         # Sector news: sector-name tokens found in the latest 300 articles (title hit = 2, summary/assets hit = 1 per token, keep score >= 2).
-        toks = _sector_tokens(_get_sector(symbol)[0])
+        toks = _sector_tokens(_get_sector(symbol)[0]) if n_tag < 5 else []
         if toks:
             seen = {x["id"] for x in out}
             scored = []
