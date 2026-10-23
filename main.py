@@ -143,6 +143,8 @@ class SmartCache:
 
 news_smart_cache = SmartCache()
 quant_smart_cache = SmartCache()
+_quant_ts_checked = {"t": 0.0}          # time of the last freshness check of quant_smart_cache (see get_quant_dashboard)
+QUANT_TS_RECHECK_SEC = 60
 
 krx_cache = TTLCache(maxsize=5, ttl=86400)
 krx_cache_lock = threading.Lock()  # [2026-09-17] cachetools @cached는 기본적으로 스레드 안전하지 않음
@@ -218,6 +220,7 @@ def refresh_quant_cache():
         with quant_smart_cache.lock:
             quant_smart_cache.data = data
             quant_smart_cache.last_ts = latest_ts
+            _quant_ts_checked["t"] = time.time()
         print(f"✅ [퀀트 캐시 예열] {latest_ts}")
     except Exception as e:
         print(f"⚠️ 퀀트 캐시 예열 실패: {e}")
@@ -295,9 +298,13 @@ def get_quant_dashboard(refresh: str = "false"):
                 # [2026-09-17] 다른 두 반환 경로와 일관되게 "cached" 필드 추가 — 강제 새로고침
                 # 직후의 값이므로 방금 새로 채운 것과 같은 의미로 False.
                 return {"status": "success", "data": quant_smart_cache.data, "cached": False}
+        # [2026-10-23 perf] the freshness check below is one DB round trip per request (1.0-1.6 s measured); skip it for 60 s after the last check
+        if quant_smart_cache.data is not None and time.time() - _quant_ts_checked["t"] < QUANT_TS_RECHECK_SEC:
+            return {"status": "success", "data": quant_smart_cache.data, "cached": True}
         latest_ts = _get_latest_quant_ts()
         with quant_smart_cache.lock:
             if quant_smart_cache.data is not None and quant_smart_cache.last_ts == latest_ts:
+                _quant_ts_checked["t"] = time.time()
                 return {"status": "success", "data": quant_smart_cache.data, "cached": True}
             # [2026-09-17] 조회(_fetch_all_quant)도 같은 락 안에서 수행 — 캐시 만료 직후
             # 동시에 들어온 요청들이 전부 stale 판정을 내리고 각자 Supabase를 중복 조회하던
@@ -306,6 +313,7 @@ def get_quant_dashboard(refresh: str = "false"):
             data = _fetch_all_quant()
             quant_smart_cache.data = data
             quant_smart_cache.last_ts = latest_ts
+            _quant_ts_checked["t"] = time.time()
         return {"status": "success", "data": data, "cached": False}
     except Exception as e: return {"status": "error", "message": str(e)}
 
