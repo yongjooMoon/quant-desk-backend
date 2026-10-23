@@ -13,3 +13,6 @@ alter table stock_tags enable row level security;
 
 -- source link of every article (2026-10-23): sent by the scheduled collector (POST /api/news/ingest); duplicates are also caught by the same URL.
 alter table market_news add column if not exists source_url text;
+
+-- when the server stored the article (2026-10-23); created_at stays the publication time. Lets a reader tell "published" from "known to us since".
+alter table market_news add column if not exists ingested_at timestamptz;

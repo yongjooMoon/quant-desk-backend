@@ -33,8 +33,9 @@ class _Q:
 
     def execute(self):
         if self.ins is not None:
-            if self.db.no_url_column and "source_url" in self.ins:
-                raise Exception('column "source_url" of relation "market_news" does not exist')
+            for c in self.db.missing_cols:
+                if c in self.ins:
+                    raise Exception(f'column "{c}" of relation "market_news" does not exist')
             self.db.rows.append(dict(self.ins))
             return _Res([self.ins])
         keys = [c.strip() for c in self.cols.split(",")]
@@ -45,7 +46,7 @@ class _Q:
 
 class FakeDB:
     def __init__(self):
-        self.rows, self.no_url_column = [], False
+        self.rows, self.no_url_column, self.missing_cols = [], False, []
 
     def table(self, name):
         assert name == "market_news"
@@ -129,7 +130,7 @@ def test_validation_limits(env):
 
 def test_works_before_source_url_column_exists(env):
     db, c = env
-    db.no_url_column = True
+    db.no_url_column = True; db.missing_cols = ["source_url"]
     r = post(c, item()).json()
     assert r["inserted"] == 1 and "source_url" not in db.rows[0]
 
@@ -154,3 +155,15 @@ def test_major_stored(env):
     db, c = env
     post(c, item(title="코스피 3.5% 급락, 외국인 매도", is_major=False, source_url=None))
     assert db.rows[0]["is_major"] is True
+
+
+def test_ingested_at_stored_and_optional(env):
+    db, c = env
+    post(c, item())
+    assert db.rows[0]["ingested_at"] and db.rows[0]["created_at"] != db.rows[0]["ingested_at"]
+    db.rows.clear(); db.missing_cols = ["ingested_at"]
+    r = post(c, item(title="다른 기사 제목 하나")).json()
+    assert r["inserted"] == 1 and "ingested_at" not in db.rows[0] and "source_url" in db.rows[0]
+    db.rows.clear(); db.missing_cols = ["ingested_at", "source_url"]
+    r = post(c, item(title="또 다른 제목 둘째")).json()
+    assert r["inserted"] == 1 and "ingested_at" not in db.rows[0] and "source_url" not in db.rows[0]

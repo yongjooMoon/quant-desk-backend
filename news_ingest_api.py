@@ -90,6 +90,24 @@ def _recent():
     return rec, urls
 
 
+OPTIONAL_COLS = ("source_url", "ingested_at")        # columns added later (sql/news_tags.sql): stored without them until the SQL has been run
+
+
+def _insert(row):
+    """Insert; when the database says an optional column does not exist yet, drop that column and retry."""
+    for _ in range(len(OPTIONAL_COLS) + 1):
+        try:
+            _sb.table("market_news").insert(row).execute()
+            return
+        except Exception as e:
+            miss = [c for c in OPTIONAL_COLS if c in row and c in str(e)]
+            if not miss:
+                raise
+            for c in miss:
+                row.pop(c)
+    raise RuntimeError("insert failed")
+
+
 @router.get("/ping")
 def ping():
     """Wake-up call for the collector (the free Render instance sleeps)."""
@@ -150,18 +168,12 @@ def ingest(body: NewsBatch, request: Request, x_news_token: Optional[str] = Head
         if (url and url in urls) or is_duplicate(it.title, category, created, recent, summary=summary):
             out["skipped"] += 1; continue
         row = {"region": category, "sector_asset": it.assets.strip(), "title": it.title.strip(), "summary": summary, "sentiment_score": it.sentiment,
-               "is_major": infer_major(it.title, it.is_major), "created_at": created.isoformat(), "tags": tags}
+               "is_major": infer_major(it.title, it.is_major), "created_at": created.isoformat(), "tags": tags,
+               "ingested_at": datetime.now(timezone.utc).isoformat()}      # when the server stored it; created_at is the publication time (KST wall clock)
         if it.source_url:
             row["source_url"] = it.source_url.strip()
         try:
-            try:
-                _sb.table("market_news").insert(row).execute()
-            except Exception as e:
-                if "source_url" in str(e) and "source_url" in row:      # column not created yet: store without the link
-                    row.pop("source_url")
-                    _sb.table("market_news").insert(row).execute()
-                else:
-                    raise
+            _insert(row)
         except Exception as e:
             print(f"[news ingest] insert failed: {type(e).__name__}")
             rej("store failed"); continue
