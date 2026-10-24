@@ -167,4 +167,41 @@ assert q_empty["qty"] == 5 and abs(q_empty["T"] - (5.0 + E._owner_day_inc(450.0,
 # cycle end resets the mode and the reverse memory
 rv_end = E.apply_fills(dict(rv, qty=4, mode="reverse", extras=dict(rv["extras"], reverse_day=3)), [dict(side="sell", qty=4, price=95.0, tag="reverse_sell")], day="2026-11-06")
 assert rv_end["qty"] == 0 and rv_end["mode"] == "normal" and "reverse_day" not in rv_end["extras"]
+# ---- reverse mode, examples of the Laor post "2. reverse mode after exhaustion"
+rev = lambda **kw: st(**dict(dict(mode="reverse", splits=40, extras={"reverse_day": 0}), **kw))
+# T: 40 splits sell T x 0.95, buy T + (40 - T) x 0.25 (T 39.5 -> 37.525 -> 38.14375); 20 splits sell x 0.9
+r_sell = E.apply_fills(rev(qty=200, avg=100.0, T=39.5, cash=400.0), [dict(side="sell", qty=10, price=90.0, tag="reverse_first_sell")], day="2026-11-10")
+assert abs(r_sell["T"] - 37.525) < 1e-9 and r_sell["extras"]["reverse_day"] == 1 and r_sell["mode"] == "reverse" and abs(r_sell["cash"] - 1300.0) < 1e-9
+r_buy = E.apply_fills(r_sell, [dict(side="buy", qty=2, price=88.0, tag="reverse_buy")], day="2026-11-11")
+assert abs(r_buy["T"] - 38.14375) < 1e-9, r_buy["T"]
+r20 = E.apply_fills(rev(qty=100, avg=100.0, T=19.5, cash=100.0, splits=20, extras={"reverse_day": 1}), [dict(side="sell", qty=10, price=90.0, tag="reverse_sell")], day="2026-11-12")
+assert abs(r20["T"] - 19.5 * 0.9) < 1e-9
+# sell counts: 200 shares -> 10, 190 -> 9, 181 -> 9, 172 -> 8 (40 splits); 198 shares, 20 splits -> 19; odd counts round down
+assert [E.plan_orders(rev(qty=q_, avg=100.0, T=39.5, cash=400.0, extras={"reverse_day": 0}), 90.0)[0]["qty"] for q_ in (200, 190, 181, 172)] == [10, 9, 9, 8]
+assert E.plan_orders(rev(qty=198, avg=100.0, T=19.5, cash=400.0, splits=20, extras={"reverse_day": 0}), 90.0)[0]["qty"] == 19
+# first day: only the MOC sell, no buy; later days: LOC sell at the five-day-average star + quarter buy cash/4 (700 / 4 = 175 -> 3 shares at 48.62 - 0.01)
+first = E.plan_orders(rev(qty=200, avg=100.0, T=39.5, cash=700.0), 50.0, [50.0] * 5)
+assert first == [dict(side="sell", type="MOC", qty=10, price=0.0, tag="reverse_first_sell")]
+later = E.plan_orders(rev(qty=190, avg=100.0, T=37.525, cash=700.0, extras={"reverse_day": 1}), 50.0, [48.0, 48.5, 49.0, 49.0, 48.62 + 0.0])
+star5 = E.r2(sum([48.0, 48.5, 49.0, 49.0, 48.62]) / 5)
+assert later[0] == dict(side="sell", type="LOC", qty=9, price=star5, tag="reverse_sell")
+assert later[1] == dict(side="buy", type="LOC", qty=E.floor_qty(175.0, star5 - 0.01), price=E.r2(star5 - 0.01), tag="reverse_buy")
+# exhausted inside reverse mode (cash / 4 cannot buy one share): MOC sell like day 1, no buy
+dry_cash = E.plan_orders(rev(qty=190, avg=100.0, T=38.0, cash=100.0, extras={"reverse_day": 2}), 50.0, [50.0] * 5)
+assert dry_cash == [dict(side="sell", type="MOC", qty=9, price=0.0, tag="reverse_first_sell")], dry_cash
+# exit: close strictly above avg x 0.8 (SOXL), after the first reverse day; T kept, normal mode again
+ex_st = rev(qty=190, avg=40.0, T=38.0, cash=500.0, extras={"reverse_day": 1})
+assert E.reverse_exit_due(ex_st, 32.01) and not E.reverse_exit_due(ex_st, 32.0) and not E.reverse_exit_due(dict(ex_st, extras={"reverse_day": 0}), 35.0)
+back = E.leave_reverse(ex_st)
+assert back["mode"] == "normal" and back["T"] == 38.0 and "reverse_day" not in back["extras"]
+assert abs(E.unit_amount(back) - 500.0 / 2.0) < 1e-9, "unit = cash / (N - T) again"
+# a normal-mode day after the return that leaves less than one unit starts reverse mode again
+again = E.apply_fills(dict(back, T=38.5), [dict(side="buy", qty=7, price=40.0, tag="star_buy")], day="2026-11-13")
+assert again["mode"] == "reverse" and again["extras"]["reverse_day"] == 0, again
+# reverse factors once per day over several calls; exit-day plan is capped by the cash; cycle end clears the reverse memory
+two = E.apply_fills(E.apply_fills(rev(qty=200, avg=100.0, T=39.5, cash=400.0), [dict(side="sell", qty=6, price=90.0, tag="reverse_first_sell")], day="2026-11-20"),
+                    [dict(side="sell", qty=4, price=90.0, tag="reverse_first_sell")], day="2026-11-20")
+assert abs(two["T"] - 37.525) < 1e-9, two["T"]
+cap = E.plan_orders(st(qty=100, avg=100.0, T=39.5, cash=1000.0, principal=27600.0), 50.0)                           # unit would be 2000 > cash: half-unit orders are capped by the cash
+assert [o for o in cap if o["side"] == "buy"], cap
 print("test_infinite_engine: all checks passed (self-verification only)")

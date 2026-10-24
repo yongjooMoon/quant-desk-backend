@@ -75,7 +75,7 @@ def plan_orders(st, prev_close, closes5=None):
         return _plan_reverse(st, prev_close, closes5)
     ver, tk, N = st["version"], st["ticker"], st["splits"]
     out = []
-    B = unit_amount(st)
+    B = min(unit_amount(st), st["cash"])                                 # cash / (N - T) can exceed the cash itself when T is close to N (e.g. right after leaving reverse mode)
     if st["qty"] <= 0:                                                  # new cycle: one LOC buy of a full unit, limit well above the last close
         px = r2(prev_close * (1 + FIRST_BUY_PREMIUM))
         q = floor_qty(B, prev_close)
@@ -127,8 +127,9 @@ def plan_orders(st, prev_close, closes5=None):
 
 
 def _plan_reverse(st, prev_close, closes5):
-    """V4.0 reverse mode (write-up): day 1 sells 1/20 (40 splits) or 1/10 (20 splits) of the shares at the close (MOC), no buy; afterwards sells the same fraction of the current shares if the close is above the
-    5-day-average star price and buys with cash/4 (LOC) below the star price."""
+    """V4.0 reverse mode (Laor post "2. reverse mode after exhaustion"): day 1 sells 1/20 (40 splits) or 1/10 (20 splits) of the shares (rounded down) at the close (MOC), no buy; afterwards, each day, the same fraction
+    of the CURRENT shares as an LOC sell at the star point (the average of the last five closes) and a quarter buy (cash / 4, LOC at star - 0.01). When cash / 4 cannot buy even one share the mid-reverse exhaustion rule
+    applies: that day is a MOC sell of the same size and no buy (the post: "if 1 share cannot be bought with the quarter, do the first-day MOC sell")."""
     N = st["splits"]
     frac = 20 if N == 40 else 10
     ex = st.get("extras", {})
@@ -139,10 +140,14 @@ def _plan_reverse(st, prev_close, closes5):
             out.append(dict(side="sell", type="MOC", qty=q_sell, price=0.0, tag="reverse_first_sell"))
         return out
     star = r2(sum(closes5) / len(closes5)) if closes5 else r2(prev_close)
-    if q_sell > 0:
-        out.append(dict(side="sell", type="LOC", qty=q_sell, price=star, tag="reverse_sell"))
     amount = st["cash"] / 4.0
     q = floor_qty(amount, star - 0.01)
+    if q <= 0:                                                          # exhausted inside reverse mode: MOC sell like on the first day, no buy
+        if q_sell > 0:
+            out.append(dict(side="sell", type="MOC", qty=q_sell, price=0.0, tag="reverse_first_sell"))
+        return out
+    if q_sell > 0:
+        out.append(dict(side="sell", type="LOC", qty=q_sell, price=star, tag="reverse_sell"))
     if q > 0:
         out.append(dict(side="buy", type="LOC", qty=q, price=r2(star - 0.01), tag="reverse_buy"))
     return out
@@ -154,8 +159,9 @@ def apply_fills(st, fills, close=None, day=None):
     s = dict(st)
     s["extras"] = dict(st.get("extras", {}))
     ver = s["version"]
+    rev_before = ver == "V4.0" and st.get("mode") == "reverse"           # fills of a reverse-mode day: T by the reverse rule, not by the normal rules
     limit_reset = False                                                  # a limit (target) sell emptied the position during this call
-    owner_day = ver == "V4.0" and day and st.get("extras", {}).get("t_mode", T_MODE_DEFAULT) == "owner"
+    owner_day = ver == "V4.0" and day and st.get("mode") != "reverse" and st.get("extras", {}).get("t_mode", T_MODE_DEFAULT) == "owner"
     if owner_day and day not in (s["extras"].get("t_day") or {}):          # the day's unit is fixed by the FIRST call that touches the day (also a sell-only call changes cash and T)
         s["extras"]["t_day"] = dict(s["extras"].get("t_day") or {}, **{day: {"unit": round(unit_amount(st), 4), "amt": 0.0, "inc": 0.0}})
     bought_amt = 0.0
@@ -186,12 +192,25 @@ def apply_fills(st, fills, close=None, day=None):
                 s["T"] = s["T"] * T_RULE["quarter_sell_mult"]
             if s["qty"] <= 0:
                 s["qty"], s["avg"] = 0, 0.0
-                if ver == "V4.0":                                        # any sale that empties the position (limit sell, or the quarter LOC after a partly filled limit sell)
+                if ver == "V4.0" and not rev_before:                     # any sale that empties the position (limit sell, or the quarter LOC after a partly filled limit sell)
                     limit_reset = True
                     s["T"] = st["T"] * 0.25                              # official V4.0: a limit sell followed by LOC buys is not an end of the cycle, T = T x 0.25 + the step of the buys (+1 or +0.5)
     if ver == "V4.0":
         mode = st.get("extras", {}).get("t_mode", T_MODE_DEFAULT)
-        if mode == "owner":                                            # day-level rule: see the module header
+        if rev_before:                                                  # post: sell T x (1 - 2/N) (0.95 for 40 splits, 0.9 for 20), buy T + (N - T) x 0.25; a day has one sell order and one buy order
+            Nn = s["splits"]
+            done_r = dict(s["extras"].get("rev_done") or {})
+            did = set(done_r.get(day, [])) if day else set()                  # each factor once per day, even when the fills arrive in several syncs
+            if "sell" not in did and any(f["side"] == "sell" and int(f["qty"]) > 0 for f in fills):
+                s["T"] = s["T"] * (1.0 - 2.0 / Nn)
+                did.add("sell")
+            if "buy" not in did and any(f["side"] == "buy" and int(f["qty"]) > 0 for f in fills):
+                s["T"] = s["T"] + (Nn - s["T"]) * 0.25
+                did.add("buy")
+            if day:
+                done_r[day] = sorted(did)
+                s["extras"]["rev_done"] = {k: done_r[k] for k in sorted(done_r)[-5:]}
+        elif mode == "owner":                                            # day-level rule: see the module header
             if fill_tags:
                 days = dict(s["extras"].get("t_day") or {})
                 prev = days.get(day) if day else None
@@ -219,7 +238,7 @@ def apply_fills(st, fills, close=None, day=None):
     if s["qty"] <= 0:                                                   # cycle finished: T resets; with compounding the new principal is the whole cash
         s["T"] = 0.0
         s["mode"] = "normal"
-        for k_ in ("t_day", "reverse_day", "reverse_since"):
+        for k_ in ("t_day", "rev_done", "reverse_day", "reverse_since"):
             s["extras"].pop(k_, None)
         if s.get("compounding", True):
             s["principal"] = s["cash"]
@@ -257,8 +276,15 @@ def _t_increment(fills, st, mode):
 
 
 def reverse_exit_due(st, close):
-    """Reverse (exhaust) mode write-up: back to normal mode once the close is above avg x (1 + REVERSE_END_PCT) (-20 % for SOXL). The post of the return rules (T after the return) is not available: the engine only REPORTS this, it never switches back on its own."""
-    return st.get("mode") == "reverse" and st.get("qty", 0) > 0 and close is not None and close > st["avg"] * (1 + REVERSE_END_PCT[st["ticker"]] / 100.0)
+    """Post: reverse mode ends once a close is strictly above the average price x (1 + REVERSE_END_PCT) (-15 % TQQQ, -20 % SOXL; e.g. average 40, SOXL close above 32); the first reverse day (the MOC sell) always happens."""
+    return st.get("mode") == "reverse" and int(st.get("extras", {}).get("reverse_day", 0)) >= 1 and st.get("qty", 0) > 0 and close is not None and close > st["avg"] * (1 + REVERSE_END_PCT[st["ticker"]] / 100.0)
+
+
+def leave_reverse(st):
+    """Back to normal mode: T is kept as it is (post), the unit is cash / (N - T) again; reverse memory cleared."""
+    s = dict(st, mode="normal")
+    s["extras"] = {k: v for k, v in (st.get("extras") or {}).items() if k not in ("reverse_day", "reverse_since", "rev_done")}
+    return s
 
 
 def implied_T(version, ticker, splits, avg, quarter_sell_price):

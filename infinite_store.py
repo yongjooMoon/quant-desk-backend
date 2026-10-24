@@ -21,5 +21,5 @@ def close_and_open_next(sb, row, st_after, today=None):
     nxt = dict(cycle_key=next_key(row["cycle_key"]), owner=row.get("owner"), cycle_no=int(row.get("cycle_no") or 1) + 1, prev_cycle_id=row["id"], name=row["name"], version=row["version"],
                ticker=row["ticker"], exch_code=row["exch_code"], market_cls=row["market_cls"], splits=row["splits"], principal_usd=round(float(st_after["principal"]), 2), compounding=row["compounding"], start_date=today,
                mode="normal", status="active", t_value=0, cash_usd=round(float(st_after["cash"]), 2) if row["compounding"] else row["principal_usd"], qty=0, avg_price=0, auto_order=row.get("auto_order", False),
-               extras={k: v for k, v in (row.get("extras") or {}).items() if k in ("t_mode",)})
+               extras={k: v for k, v in (row.get("extras") or {}).items() if k in ("t_mode", "last_fill_ts", "ladder", "ladder_n")})
     return sb.table("infinite_cycles").insert(nxt).execute().data[0]
