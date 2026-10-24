@@ -19,11 +19,11 @@ T_RULE = {"half": 0.5, "full": 1.0, "quarter_sell_mult": 0.75}                  
 # amount, else +0.5 (calibrated on three observations only: 0.63 -> +0.5, 0.71 -> +1, 0.74 -> +1.5 unexplained). mode "doc" = the write-up (each half-size order +0.5, a full unit +1).
 APP_FULL_RATIO = 0.7
 LADDER_N = 6                  # "폭락장 대비 추가 매수" (the owner's app guide): after each buy order of q shares for `amount`, LOC buys of 1 share at amount/(q+1), amount/(q+2) ... (6 of them); they only fill when the close falls that far
-# mode "owner" (default since 2026-10-24, the owner's own rule): the crash-prep ladder buys ("폭락장 대비", tags ladder / ladder_x / limit_buy) never add T. First half (T < N/2): the average-price order and the
-# star-point order each add +0.5 when filled (both = +1). Second half: only the star-point buy adds +1 per day, however many shares the ladder adds to it. First buy of a cycle +1. Quarter sell x0.75 unchanged.
-# The owner's third-party app counts every fill row as +1 (it showed T 31.375 on 2026-10-24 for what is T 27.375 under this rule: four 1-share ladder rows counted +1 each).
+# mode "owner" (default since 2026-10-24, the owner's own rule, verified against the T steps he entered in his app for all 24 fill days of the SOXL cycle): T moves once per DAY by the size of the day's buys measured in units:
+# inc = clamp(round-to-0.5(day buy amount / unit), 0, 1) with unit = cash/(N - T) at the START of the day. Two half-size orders (or one full order) = +1, one half-size order = +0.5, crash-prep ladder shares add nothing to T
+# (their amount can never lift the day above +1). First buy of a cycle +1. Quarter sell x0.75 unchanged. His third-party app counted every fill row +1 (T 31.375 for what is 18.375 here).
 T_MODE_DEFAULT = "owner"
-OWNER_MAIN_TAGS = ("avg_buy", "star_buy")
+OWNER_ROUND = 0.5                                                  # T granularity of the owner rule
 
 
 def r2(x):
@@ -154,6 +154,9 @@ def apply_fills(st, fills, close=None, day=None):
     s = dict(st)
     s["extras"] = dict(st.get("extras", {}))
     ver = s["version"]
+    owner_day = ver == "V4.0" and day and st.get("extras", {}).get("t_mode", T_MODE_DEFAULT) == "owner"
+    if owner_day and day not in (s["extras"].get("t_day") or {}):          # the day's unit is fixed by the FIRST call that touches the day (also a sell-only call changes cash and T)
+        s["extras"]["t_day"] = dict(s["extras"].get("t_day") or {}, **{day: {"unit": round(unit_amount(st), 4), "amt": 0.0, "inc": 0.0}})
     bought_amt = 0.0
     fill_tags = []
     manual_t = 0.0
@@ -184,18 +187,18 @@ def apply_fills(st, fills, close=None, day=None):
                 s["qty"], s["avg"] = 0, 0.0
     if ver == "V4.0":
         mode = st.get("extras", {}).get("t_mode", T_MODE_DEFAULT)
-        if mode == "owner":                                            # one filled main-order row = one order (the owner's own count); ladder rows never count
-            tags_ = [t_ for t_, _ in fill_tags]
-            if "first_buy" in tags_:
-                s["T"] = s["T"] + T_RULE["full"]
-            else:
-                n_new = sum(1 for t_ in tags_ if t_ in OWNER_MAIN_TAGS)
-                done = dict(s["extras"].get("t_counted") or {})
-                n_done = int(done.get(day, 0)) if day else 0                # main rows of this day counted by earlier syncs: a day never counts more than two orders (first half) / one (second half)
-                s["T"] = s["T"] + _owner_inc(is_first_half(st), n_done, n_new)
-                if day and n_new:
-                    done[day] = n_done + n_new
-                    s["extras"]["t_counted"] = {k: done[k] for k in sorted(done)[-5:]}
+        if mode == "owner":                                            # day-level rule: see the module header
+            if fill_tags:
+                days = dict(s["extras"].get("t_day") or {})
+                prev = days.get(day) if day else None
+                unit = float(prev["unit"]) if prev else unit_amount(st)       # the unit of the day's FIRST call (T and cash move during the day)
+                amt = (float(prev["amt"]) if prev else 0.0) + sum(a_ for _, a_ in fill_tags)
+                target = 1.0 if any(t_ == "first_buy" for t_, _ in fill_tags) else _owner_day_inc(amt, unit)
+                done = float(prev["inc"]) if prev else 0.0
+                s["T"] = s["T"] + (target - done)
+                if day:
+                    days[day] = {"unit": round(unit, 4), "amt": round(amt, 2), "inc": target}
+                    s["extras"]["t_day"] = {k: days[k] for k in sorted(days)[-5:]}
         elif fill_tags:
             s["T"] = s["T"] + _t_increment(fill_tags, st, mode)
         s["T"] = s["T"] + manual_t
@@ -204,16 +207,17 @@ def apply_fills(st, fills, close=None, day=None):
         s["T"] = round((s["avg"] * s["qty"]) / unit, 2) if s["qty"] > 0 else 0.0
     if s["qty"] <= 0:                                                   # cycle finished: T resets; with compounding the new principal is the whole cash
         s["T"] = 0.0
+        s["extras"].pop("t_day", None)
         if s.get("compounding", True):
             s["principal"] = s["cash"]
     return s
 
 
-def _owner_inc(first_half, n_done, n_new):
-    """Owner rule for the main-order rows of one day. First half: each of the (at most two) orders +0.5. Second half: one order +1 per day."""
-    if first_half:
-        return T_RULE["half"] * (min(2, n_done + n_new) - min(2, n_done))
-    return T_RULE["full"] if (n_done == 0 and n_new > 0) else 0.0
+def _owner_day_inc(amount, unit):
+    """Owner rule: the day's buy amount in units, rounded to the nearest 0.5 and capped at 1 (two halves or one full order = +1, one half = +0.5, ladder alone = 0)."""
+    if unit <= 0:
+        return 0.0
+    return min(1.0, max(0.0, math.floor(amount / unit / OWNER_ROUND + 0.5) * OWNER_ROUND))
 
 
 def _t_increment(fills, st, mode):
