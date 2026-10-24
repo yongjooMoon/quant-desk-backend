@@ -138,4 +138,33 @@ assert [x["price"] for x in E._ladder(568.45, 9, 3)] == [56.85, 51.68, 47.37]
 pl = E.plan_orders(dict(st(qty=60, avg=100.0, T=10.0, cash=19000.0, principal=27600.0), extras={"ladder": True}), 98.0)
 main_q = sum(o["qty"] for o in pl if o["tag"] in ("avg_buy", "star_buy"))
 assert [o["price"] for o in pl if o["tag"] == "ladder_x"][0] == E.r2((19000.0 / 30.0) / (main_q + 1)), "first-half ladder is built from the full unit and all main shares"
+# ---- official V4.0: limit sell + LOC buys of the same order day: no cycle end, T = T x 0.25 + step of the buys
+lim = st(qty=114, avg=115.63, T=30.0, cash=14514.5, principal=27600.0)
+sell = dict(side="sell", qty=114, price=138.76, tag="target_sell")
+buys = [dict(side="buy", qty=3, price=100.0, tag="avg_buy"), dict(side="buy", qty=2, price=100.0, tag="star_buy")]       # unit of the order day = 14514.5 / (40 - 30) = 1451.45 (before the sale); 500 / 1451 = 0.34 -> +0.5
+res = E.apply_fills(lim, [sell] + buys, day="2026-11-02")
+assert res["qty"] == 5 and abs(res["avg"] - 100.0) < 1e-9, res
+assert abs(res["T"] - 8.0) < 1e-9, res["T"]                                       # 30 x 0.25 = 7.5, + 0.5 for the half-size buys
+assert abs(res["principal"] - 27600.0) < 1e-9 and res.get("mode", "normal") == "normal"
+big = [dict(side="buy", qty=7, price=100.0, tag="avg_buy"), dict(side="buy", qty=7, price=100.0, tag="star_buy")]
+lim2 = st(qty=114, avg=115.63, T=30.0, cash=14000.0, principal=27600.0)                                              # unit 1400 -> 1400 / 1400 = 1.0 -> +1 (two half-size buys): T = 7.5 + 1
+assert abs(E.apply_fills(lim2, [sell] + big, day="2026-11-02")["T"] - 8.5) < 1e-9
+alone = E.apply_fills(lim, [sell], day="2026-11-02")
+assert alone["qty"] == 0 and alone["T"] == 0.0, "a limit sell with no LOC buys is still the end of the cycle"
+# ---- exhaust mode: T above splits - 1 switches the cycle to reverse mode (official); T = 39 itself stays normal
+ex0 = st(qty=80, avg=100.0, T=38.0, cash=600.0, principal=27600.0)                                                   # unit 600 / 2 = 300
+r39 = E.apply_fills(ex0, [dict(side="buy", qty=3, price=100.0, tag="star_buy")], day="2026-11-03")                  # 300 / 300 = 1 -> T 39.0
+assert abs(r39["T"] - 39.0) < 1e-9 and r39.get("mode", "normal") == "normal"
+ex1 = st(qty=80, avg=100.0, T=38.5, cash=450.0, principal=27600.0)                                                   # unit 450 / 1.5 = 300
+r395 = E.apply_fills(ex1, [dict(side="buy", qty=3, price=100.0, tag="star_buy")], day="2026-11-03")                 # +1 -> 39.5 > 39
+assert r395["mode"] == "reverse" and r395["extras"]["reverse_day"] == 0, r395
+rv = E.apply_fills(dict(r395, qty=83), [dict(side="sell", qty=4, price=90.0, tag="reverse_first_sell")], day="2026-11-04")
+assert rv["extras"]["reverse_day"] == 1 and rv["mode"] == "reverse"
+assert E.reverse_exit_due(dict(rv, avg=100.0), 81.0) and not E.reverse_exit_due(dict(rv, avg=100.0), 79.0) and not E.reverse_exit_due(st(qty=5, avg=100.0), 120.0)
+# a partly filled limit sell followed by the quarter LOC that empties the position is also "limit sell + LOC buys": T x 0.25, no cycle end when buys follow in the same order day
+q_empty = E.apply_fills(st(qty=30, avg=100.0, T=20.0, cash=5000.0, principal=27600.0), [dict(side="sell", qty=30, price=120.0, tag="quarter_sell"), dict(side="buy", qty=5, price=90.0, tag="star_buy")], day="2026-11-05")
+assert q_empty["qty"] == 5 and abs(q_empty["T"] - (5.0 + E._owner_day_inc(450.0, 5000.0 / 20.0))) < 1e-9, q_empty["T"]
+# cycle end resets the mode and the reverse memory
+rv_end = E.apply_fills(dict(rv, qty=4, mode="reverse", extras=dict(rv["extras"], reverse_day=3)), [dict(side="sell", qty=4, price=95.0, tag="reverse_sell")], day="2026-11-06")
+assert rv_end["qty"] == 0 and rv_end["mode"] == "normal" and "reverse_day" not in rv_end["extras"]
 print("test_infinite_engine: all checks passed (self-verification only)")

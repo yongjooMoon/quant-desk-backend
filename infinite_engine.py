@@ -154,6 +154,7 @@ def apply_fills(st, fills, close=None, day=None):
     s = dict(st)
     s["extras"] = dict(st.get("extras", {}))
     ver = s["version"]
+    limit_reset = False                                                  # a limit (target) sell emptied the position during this call
     owner_day = ver == "V4.0" and day and st.get("extras", {}).get("t_mode", T_MODE_DEFAULT) == "owner"
     if owner_day and day not in (s["extras"].get("t_day") or {}):          # the day's unit is fixed by the FIRST call that touches the day (also a sell-only call changes cash and T)
         s["extras"]["t_day"] = dict(s["extras"].get("t_day") or {}, **{day: {"unit": round(unit_amount(st), 4), "amt": 0.0, "inc": 0.0}})
@@ -185,6 +186,9 @@ def apply_fills(st, fills, close=None, day=None):
                 s["T"] = s["T"] * T_RULE["quarter_sell_mult"]
             if s["qty"] <= 0:
                 s["qty"], s["avg"] = 0, 0.0
+                if ver == "V4.0":                                        # any sale that empties the position (limit sell, or the quarter LOC after a partly filled limit sell)
+                    limit_reset = True
+                    s["T"] = st["T"] * 0.25                              # official V4.0: a limit sell followed by LOC buys is not an end of the cycle, T = T x 0.25 + the step of the buys (+1 or +0.5)
     if ver == "V4.0":
         mode = st.get("extras", {}).get("t_mode", T_MODE_DEFAULT)
         if mode == "owner":                                            # day-level rule: see the module header
@@ -205,9 +209,18 @@ def apply_fills(st, fills, close=None, day=None):
     else:
         unit = s["principal"] / s["splits"]
         s["T"] = round((s["avg"] * s["qty"]) / unit, 2) if s["qty"] > 0 else 0.0
+    if ver == "V4.0" and s["qty"] > 0:                                  # exhaust mode (official): starts when T exceeds splits - 1, i.e. less than one unit is left
+        if s.get("mode", "normal") == "normal" and s["T"] > s["splits"] - 1:
+            s["mode"] = "reverse"
+            s["extras"]["reverse_day"] = 0
+            s["extras"]["reverse_since"] = day or ""
+        elif s.get("mode") == "reverse" and any(f.get("tag") == "reverse_first_sell" and f["side"] == "sell" for f in fills):
+            s["extras"]["reverse_day"] = max(1, int(s["extras"].get("reverse_day", 0)))
     if s["qty"] <= 0:                                                   # cycle finished: T resets; with compounding the new principal is the whole cash
         s["T"] = 0.0
-        s["extras"].pop("t_day", None)
+        s["mode"] = "normal"
+        for k_ in ("t_day", "reverse_day", "reverse_since"):
+            s["extras"].pop(k_, None)
         if s.get("compounding", True):
             s["principal"] = s["cash"]
     return s
@@ -241,6 +254,11 @@ def _t_increment(fills, st, mode):
     for t in tags:
         inc += T_RULE["half"] if (first_half or t not in ("star_buy", "avg_buy")) else T_RULE["full"]
     return inc
+
+
+def reverse_exit_due(st, close):
+    """Reverse (exhaust) mode write-up: back to normal mode once the close is above avg x (1 + REVERSE_END_PCT) (-20 % for SOXL). The post of the return rules (T after the return) is not available: the engine only REPORTS this, it never switches back on its own."""
+    return st.get("mode") == "reverse" and st.get("qty", 0) > 0 and close is not None and close > st["avg"] * (1 + REVERSE_END_PCT[st["ticker"]] / 100.0)
 
 
 def implied_T(version, ticker, splits, avg, quarter_sell_price):

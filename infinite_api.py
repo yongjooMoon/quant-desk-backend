@@ -244,7 +244,7 @@ def add_trade(cycle_id: str, body: TradeIn, user: dict = Depends(current_user)):
         nxt = _close_and_open_next(row, st)
         done = _sb.table("infinite_cycles").select("*").eq("id", cycle_id).execute().data[0]
         return {"status": "success", "data": _view(done), "next": _view(nxt)}
-    upd = dict(t_value=st["T"], cash_usd=st["cash"], qty=st["qty"], avg_price=st["avg"], principal_usd=st["principal"], extras=st["extras"], updated_at=_now())
+    upd = dict(t_value=st["T"], cash_usd=st["cash"], qty=st["qty"], avg_price=st["avg"], principal_usd=st["principal"], mode=st.get("mode", "normal"), extras=st["extras"], updated_at=_now())
     r = _sb.table("infinite_cycles").update(upd).eq("id", cycle_id).execute()
     return {"status": "success", "data": _view(r.data[0]), "next": None}
 
