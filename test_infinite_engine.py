@@ -65,7 +65,7 @@ f = E.apply_fills(st(cash=27400.0), [dict(side="buy", qty=4, price=151.95, tag="
 assert f["T"] == 1.0 and f["qty"] == 4 and abs(f["avg"] - 151.95) < 1e-9 and abs(f["cash"] - (27400 - 607.8)) < 1e-6
 
 # ---- app mode, second half: a row is +1 when its amount is >= 0.7 of the unit, else +0.5
-sh = st(qty=60, avg=136.7, T=21.375, cash=19300.0)               # unit 19300 / 18.625 = 1036.2
+sh = st(qty=60, avg=136.7, T=21.375, cash=19300.0, extras={"t_mode": "app"})               # unit 19300 / 18.625 = 1036.2
 assert abs(E.apply_fills(sh, [dict(side="buy", qty=7, price=93.67, tag="ladder")])["T"] - 21.875) < 1e-9        # 655.7 / 1036 = 0.63 -> +0.5 (owner list: 21.375 -> 21.875)
 assert abs(E.apply_fills(sh, [dict(side="buy", qty=8, price=98.65, tag="ladder")])["T"] - 22.375) < 1e-9        # 789 / 1036 = 0.76 -> +1
 # ---- replay of the owner's first cycle in app mode: T after 2026-10-15 fills = 21.375 (from the outstanding LOC price), after the whole list 24.375 per his app screenshot
@@ -90,7 +90,40 @@ lad = [(x["price"], x["qty"]) for x in E.plan_orders(app, 97.55) if x["tag"] == 
 assert lad == [(110.52, 1), (100.47, 1), (92.1, 1), (85.02, 1), (78.94, 1), (73.68, 1)], lad
 assert not [x for x in E.plan_orders(dict(app, extras={"ladder_n": 0}), 97.55) if x["tag"] == "ladder_x"], "ladder can be switched off per cycle"
 # ladder fills do not count as extra T rows: 9 + 1 + 1 shares in the second half
-base = st(qty=83, avg=125.6306, T=24.375, cash=17268.93, principal=27600.0)
+base = st(qty=83, avg=125.6306, T=24.375, cash=17268.93, principal=27600.0, extras={"t_mode": "app"})
 f1 = E.apply_fills(base, [dict(side="buy", qty=9, price=97.0, tag="star_buy"), dict(side="buy", qty=1, price=97.0, tag="ladder_x"), dict(side="buy", qty=1, price=97.0, tag="ladder_x")])
 assert abs(f1["T"] - 25.375) < 1e-9 and f1["qty"] == 94, f1["T"]            # one row of (9+2) x 97 = 1067 >= 0.7 x unit -> +1
+# ---- owner mode (default, 2026-10-24): ladder never adds T; first half avg/star +0.5 each; second half star_buy +1 per day
+assert E.T_MODE_DEFAULT == "owner"
+fh = st(qty=27, avg=150.96, T=9.37, cash=20000.0)
+assert abs(E.apply_fills(fh, both)["T"] - 10.37) < 1e-9, "first half: avg_buy 0.5 + star_buy 0.5"
+assert abs(E.apply_fills(fh, [both[0]])["T"] - 9.87) < 1e-9, "first half: one order = 0.5"
+assert abs(E.apply_fills(fh, both + [dict(side="buy", qty=2, price=130.0, tag="ladder_x")])["T"] - 10.37) < 1e-9, "ladder rows add no T"
+assert abs(E.apply_fills(fh, [dict(side="buy", qty=1, price=130.0, tag="ladder_x")])["T"] - 9.37) < 1e-9, "ladder-only day adds nothing"
+sh2 = st(qty=101, avg=121.0, T=24.375, cash=16000.0, principal=27600.0)
+day = [dict(side="buy", qty=9, price=83.56, tag="star_buy")] + [dict(side="buy", qty=1, price=83.56, tag="ladder_x")] * 4
+assert abs(E.apply_fills(sh2, day)["T"] - 25.375) < 1e-9, "second half: 9 + 4 ladder shares = one +1"
+assert abs(E.apply_fills(sh2, [dict(side="buy", qty=9, price=82.11, tag="star_buy")])["T"] - 25.375) < 1e-9, "second half: small star amount still +1"
+# a main order counts once per day even when its fill is synced twice
+a1 = E.apply_fills(sh2, [dict(side="buy", qty=5, price=83.0, tag="star_buy")], day="2026-10-24")
+a2 = E.apply_fills(a1, [dict(side="buy", qty=4, price=83.0, tag="star_buy"), dict(side="buy", qty=1, price=83.0, tag="ladder_x")], day="2026-10-24")
+assert abs(a2["T"] - 25.375) < 1e-9, a2["T"]
+a3 = E.apply_fills(a2, [dict(side="buy", qty=4, price=80.0, tag="star_buy")], day="2026-10-25")
+assert abs(a3["T"] - 26.375) < 1e-9, "next day counts again"
+# replay of the owner's last three days (T 24.375 on 2026-10-21): 25.375, 26.375, 27.375 (his third-party app shows 31.375 because it counts each of the 4 ladder rows +1)
+r = st(qty=83 + 8, avg=121.0, T=24.375, cash=16000.0, principal=27600.0)
+for d_, rows in [("2026-10-22", [(9, 103.24, "star_buy")]), ("2026-10-23", [(9, 82.11, "star_buy")]), ("2026-10-24", [(9, 83.56, "star_buy")] + [(1, 83.56, "ladder_x")] * 4)]:
+    r = E.apply_fills(r, [dict(side="buy", qty=q_, price=p_, tag=t_) for q_, p_, t_ in rows], day=d_)
+assert abs(r["T"] - 27.375) < 1e-9, r["T"]
+# ---- official V4.0 table (Laor cafe post) first half: star LOC 78.11 x3 + average LOC 69.75 x4, ladder 67.40, 59.91 = B / (7 + k) with B = 539.2
+fh_lad = E._ladder(539.2, 7, 2)
+assert [x["price"] for x in fh_lad] == [67.4, 59.91], fh_lad
+# second half official example: star 59.54 x9, ladder 56.85, 51.68, 47.37 = 568.45 / (9 + k) (B is unknown to the cent)
+assert [x["price"] for x in E._ladder(568.45, 9, 3)] == [56.85, 51.68, 47.37]
+pl = E.plan_orders(dict(st(qty=60, avg=100.0, T=10.0, cash=19000.0, principal=27600.0), extras={"ladder": True}), 98.0)
+main_q = sum(o["qty"] for o in pl if o["tag"] in ("avg_buy", "star_buy"))
+assert [o["price"] for o in pl if o["tag"] == "ladder_x"][0] == E.r2((19000.0 / 30.0) / (main_q + 1)), "first-half ladder is built from the full unit and all main shares"
+# owner rule counts main-order ROWS (two 3-share rows of 2026-10-15 = two orders = +1 in the first half, one row = +0.5)
+two = [dict(side="buy", qty=3, price=107.35, tag="star_buy"), dict(side="buy", qty=3, price=107.35, tag="star_buy")]
+assert abs(E.apply_fills(fh, two)["T"] - (9.37 + 1.0)) < 1e-9 and abs(E.apply_fills(fh, two[:1])["T"] - 9.87) < 1e-9
 print("test_infinite_engine: all checks passed (self-verification only)")

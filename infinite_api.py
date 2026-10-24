@@ -190,7 +190,7 @@ def create_cycle(body: CycleIn, user: dict = Depends(current_user)):
     cash = body.cash_usd if body.cash_usd is not None else max(body.principal_usd - body.qty * body.avg_price, 0.0)
     row = dict(cycle_key=key, owner=user["username"], cycle_no=1, name=body.name, version=body.version, ticker=body.ticker, exch_code=exch, market_cls=mk, splits=body.splits,
                principal_usd=body.principal_usd, compounding=body.compounding, start_date=body.start_date, mode="normal", status="active", t_value=body.t_value, cash_usd=round(cash, 2), qty=body.qty,
-               avg_price=body.avg_price, auto_order=False, extras=dict(body.extras or {}, t_mode="app"))
+               avg_price=body.avg_price, auto_order=False, extras=dict(body.extras or {}, t_mode="owner"))
     r = _sb.table("infinite_cycles").insert(row).execute()
     return {"status": "success", "data": _view(r.data[0])}
 
@@ -237,7 +237,7 @@ def add_trade(cycle_id: str, body: TradeIn, user: dict = Depends(current_user)):
         raise HTTPException(422, "bad trade_date")
     if row.get("status") == "done":
         raise HTTPException(409, "cycle is done")
-    st = E.apply_fills(_state(row), [dict(side=body.side, qty=body.qty, price=body.price, tag=body.tag or "", t_step=body.t_step)])
+    st = E.apply_fills(_state(row), [dict(side=body.side, qty=body.qty, price=body.price, tag=body.tag or "", t_step=body.t_step)], day=body.trade_date)
     _sb.table("infinite_trades").insert(dict(cycle_id=cycle_id, trade_date=body.trade_date, side=body.side, qty=body.qty, price=body.price, tag=body.tag, order_no=body.order_no,
                                              t_after=st["T"], source=body.source)).execute()
     if st["qty"] <= 0 and int(row["qty"]) > 0:

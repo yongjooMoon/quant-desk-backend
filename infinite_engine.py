@@ -19,7 +19,11 @@ T_RULE = {"half": 0.5, "full": 1.0, "quarter_sell_mult": 0.75}                  
 # amount, else +0.5 (calibrated on three observations only: 0.63 -> +0.5, 0.71 -> +1, 0.74 -> +1.5 unexplained). mode "doc" = the write-up (each half-size order +0.5, a full unit +1).
 APP_FULL_RATIO = 0.7
 LADDER_N = 6                  # "폭락장 대비 추가 매수" (the owner's app guide): after each buy order of q shares for `amount`, LOC buys of 1 share at amount/(q+1), amount/(q+2) ... (6 of them); they only fill when the close falls that far
-T_MODE_DEFAULT = "app"
+# mode "owner" (default since 2026-10-24, the owner's own rule): the crash-prep ladder buys ("폭락장 대비", tags ladder / ladder_x / limit_buy) never add T. First half (T < N/2): the average-price order and the
+# star-point order each add +0.5 when filled (both = +1). Second half: only the star-point buy adds +1 per day, however many shares the ladder adds to it. First buy of a cycle +1. Quarter sell x0.75 unchanged.
+# The owner's third-party app counts every fill row as +1 (it showed T 31.375 on 2026-10-24 for what is T 27.375 under this rule: four 1-share ladder rows counted +1 each).
+T_MODE_DEFAULT = "owner"
+OWNER_MAIN_TAGS = ("avg_buy", "star_buy")
 
 
 def r2(x):
@@ -56,7 +60,7 @@ def is_first_half(st):
 
 
 def _ladder(amount, qty, n):
-    """Extra 1-share LOC buys below a main buy: price = amount / (qty + k), k = 1..n (owner's app: unit 1105.21, 9 shares -> 110.52, 100.47, 92.10, 85.02, 78.94, 73.68)."""
+    """Extra 1-share LOC buys below the main buys: price = amount / (qty + k), k = 1..n, amount = the full unit and qty = all main shares (official V4.0 tables, first half 539.2/(3+4+k)) (owner's app: unit 1105.21, 9 shares -> 110.52, 100.47, 92.10, 85.02, 78.94, 73.68)."""
     out = []
     for k in range(1, n + 1):
         px = r2(amount / (qty + k))
@@ -105,11 +109,8 @@ def plan_orders(st, prev_close, closes5=None):
     ex = st.get("extras") or {}
     n_lad = int(ex.get("ladder_n", LADDER_N)) if ex.get("ladder") else 0                 # ladder only for cycles with the per-cycle ladder switch (extras.ladder) on
     if n_lad > 0:
-        amounts = {"avg_buy": B / 2.0 if is_first_half(st) else B, "star_buy": B / 2.0 if is_first_half(st) else B}
-        lad = []
-        for o in out:
-            if o["tag"] in amounts:
-                lad += _ladder(amounts[o["tag"]], o["qty"], n_lad)
+        main_q = sum(o["qty"] for o in out if o["tag"] in ("avg_buy", "star_buy"))
+        lad = _ladder(B, main_q, n_lad) if main_q > 0 else []                              # official V4.0 tables: ladder price = full unit B / (shares of the main orders + k), first half included (B=539.2: 7 shares -> 67.40, 59.91)
         spent = sum(o["qty"] * o["price"] for o in out)
         for o in lad:                                                  # the ladder shares are bought only on a lower close, but never plan more than the cash left
             if spent + o["price"] <= st["cash"] + 1e-6:
@@ -147,7 +148,7 @@ def _plan_reverse(st, prev_close, closes5):
     return out
 
 
-def apply_fills(st, fills, close=None):
+def apply_fills(st, fills, close=None, day=None):
     """Update the state with the day's fills [{side, qty, price, tag}] (tag as in plan_orders; '' when unknown) and return the new state (the input is not modified).
     V4.0 T updates (write-up): full unit bought +1, half +0.5, quarter sell T*0.75, limit (target) sell that empties the position ends the cycle; V2.2: T = invested cost / unit (recomputed)."""
     s = dict(st)
@@ -182,8 +183,21 @@ def apply_fills(st, fills, close=None):
             if s["qty"] <= 0:
                 s["qty"], s["avg"] = 0, 0.0
     if ver == "V4.0":
-        if fill_tags:
-            s["T"] = s["T"] + _t_increment(fill_tags, st, st.get("extras", {}).get("t_mode", T_MODE_DEFAULT))
+        mode = st.get("extras", {}).get("t_mode", T_MODE_DEFAULT)
+        if mode == "owner":                                            # one filled main-order row = one order (the owner's own count); ladder rows never count
+            tags_ = [t_ for t_, _ in fill_tags]
+            if "first_buy" in tags_:
+                s["T"] = s["T"] + T_RULE["full"]
+            else:
+                n_new = sum(1 for t_ in tags_ if t_ in OWNER_MAIN_TAGS)
+                done = dict(s["extras"].get("t_counted") or {})
+                n_done = int(done.get(day, 0)) if day else 0                # main rows of this day counted by earlier syncs: a day never counts more than two orders (first half) / one (second half)
+                s["T"] = s["T"] + _owner_inc(is_first_half(st), n_done, n_new)
+                if day and n_new:
+                    done[day] = n_done + n_new
+                    s["extras"]["t_counted"] = {k: done[k] for k in sorted(done)[-5:]}
+        elif fill_tags:
+            s["T"] = s["T"] + _t_increment(fill_tags, st, mode)
         s["T"] = s["T"] + manual_t
     else:
         unit = s["principal"] / s["splits"]
@@ -193,6 +207,13 @@ def apply_fills(st, fills, close=None):
         if s.get("compounding", True):
             s["principal"] = s["cash"]
     return s
+
+
+def _owner_inc(first_half, n_done, n_new):
+    """Owner rule for the main-order rows of one day. First half: each of the (at most two) orders +0.5. Second half: one order +1 per day."""
+    if first_half:
+        return T_RULE["half"] * (min(2, n_done + n_new) - min(2, n_done))
+    return T_RULE["full"] if (n_done == 0 and n_new > 0) else 0.0
 
 
 def _t_increment(fills, st, mode):
